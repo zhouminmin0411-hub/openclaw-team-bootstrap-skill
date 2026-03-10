@@ -158,3 +158,13 @@ Important: on Feishu, `requireMention=false` only lowers the reply gate. Whether
 
 - Feishu discovery is config-based, not API-based. New groups that have never appeared in config or bindings will not be discovered automatically.
 - Markdown table parsing is intentionally lightweight; keep the table structure unchanged.
+
+## Mention priority rule
+
+When configuring multi-bot targets, treat an explicit bot mention as a higher-priority signal than the default reply policy. The intended behavior is:
+
+- if a message explicitly mentions one bot, that bot should be the only default responder for that message
+- other bots should stay silent unless they were also explicitly mentioned
+- only when no bot was explicitly mentioned should the default `requireMention=false` responders answer
+
+This skill can encode `requireMention` and mention patterns, but strict enforcement of this rule still depends on OpenClaw runtime behavior. Use `check-target` to surface this expectation in reports when debugging target behavior.
