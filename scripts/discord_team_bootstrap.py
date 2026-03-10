@@ -1,23 +1,86 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-WORKSPACE = Path('/root/clawd/skills/discord-team-bootstrap')
-DRAFT_PATH = WORKSPACE / 'discord-team-setup.draft.md'
-REPORT_PATH = WORKSPACE / 'discord-team-setup.report.md'
-CONFIG_PATH = Path('/root/.openclaw/openclaw.json')
-VALIDATE_SCRIPT = '/root/.openclaw/scripts/validate-openclaw-config.py'
-DEFAULT_ROLES = ['trouble', 'friday']
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SKILL_DIR = SCRIPT_DIR.parent
+DEFAULT_CONFIG_PATH = Path.home() / '.openclaw' / 'openclaw.json'
+MANAGED_AGENT_RE = re.compile(r'.+_(ch|fg)_.+')
 SUPPORTED_PLATFORMS = {'discord', 'feishu'}
 
 
+@dataclass
+class RuntimeConfig:
+    skill_dir: Path
+    draft_path: Path
+    report_path: Path
+    config_path: Path
+    validate_script: Optional[Path]
+    openclaw_bin: str
+    fallback_workspace: str
+
+
+def _resolve_path(raw: str) -> Path:
+    return Path(raw).expanduser().resolve()
+
+
+def _env(name: str) -> str:
+    return os.environ.get(name, '').strip()
+
+
+def build_runtime(args: Optional[argparse.Namespace] = None) -> RuntimeConfig:
+    skill_dir_raw = getattr(args, 'skill_dir', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_SKILL_DIR') or str(DEFAULT_SKILL_DIR)
+    skill_dir = _resolve_path(skill_dir_raw)
+
+    config_path_raw = getattr(args, 'config_path', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_CONFIG_PATH') or str(DEFAULT_CONFIG_PATH)
+    config_path = _resolve_path(config_path_raw)
+
+    draft_path_raw = getattr(args, 'draft_path', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_DRAFT_PATH') or str(
+        skill_dir / 'team-setup.draft.md'
+    )
+    report_path_raw = getattr(args, 'report_path', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_REPORT_PATH') or str(
+        skill_dir / 'team-setup.report.md'
+    )
+
+    validate_script_raw = getattr(args, 'validate_script', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_VALIDATE_SCRIPT')
+    if validate_script_raw:
+        validate_script = _resolve_path(validate_script_raw)
+    else:
+        validate_script = config_path.parent / 'scripts' / 'validate-openclaw-config.py'
+
+    openclaw_bin = getattr(args, 'openclaw_bin', '') or _env('OPENCLAW_TEAM_BOOTSTRAP_OPENCLAW_BIN') or 'openclaw'
+    fallback_workspace = (
+        getattr(args, 'fallback_workspace', '')
+        or _env('OPENCLAW_TEAM_BOOTSTRAP_FALLBACK_WORKSPACE')
+        or str(Path.home())
+    )
+
+    return RuntimeConfig(
+        skill_dir=skill_dir,
+        draft_path=_resolve_path(draft_path_raw),
+        report_path=_resolve_path(report_path_raw),
+        config_path=config_path,
+        validate_script=validate_script,
+        openclaw_bin=openclaw_bin,
+        fallback_workspace=fallback_workspace,
+    )
+
+
+RUNTIME = build_runtime()
+
+
 def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Command not found: {cmd[0]}") from exc
     if check and p.returncode != 0:
         raise RuntimeError(
             f"Command failed ({p.returncode}): {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
@@ -34,27 +97,26 @@ def save_json(path: Path, data: dict):
 
 
 def now_str() -> str:
-    return datetime.now().strftime('%Y-%m-%d %H:%M Asia/Shanghai')
+    return datetime.now().astimezone().isoformat(timespec='minutes')
+
+
+def parse_csv(text: str) -> List[str]:
+    return [x.strip() for x in (text or '').split(',') if x.strip()]
+
+
+def dedupe(values: List[str]) -> List[str]:
+    out = []
+    for value in values:
+        if value and value not in out:
+            out.append(value)
+    return out
 
 
 def normalize_peer_id(platform: str, raw: str) -> str:
-    v = (raw or '').strip()
-    if platform == 'feishu' and v.startswith('chat:'):
-        return v.split(':', 1)[1].strip()
-    return v
-
-
-def infer_platform_from_id(raw: str) -> str:
-    v = (raw or '').strip()
-    if v.isdigit():
-        return 'discord'
-    if v.startswith('oc_') or v.startswith('chat:oc_'):
-        return 'feishu'
-    return 'unknown'
-
-
-def peer_kind_for(platform: str) -> str:
-    return 'channel' if platform == 'discord' else 'group'
+    value = (raw or '').strip()
+    if platform == 'feishu' and value.startswith('chat:'):
+        return value.split(':', 1)[1].strip()
+    return value
 
 
 def agent_prefix_for(platform: str) -> str:
@@ -65,14 +127,60 @@ def make_agent_id(role: str, platform: str, peer_id: str) -> str:
     return f"{role}_{agent_prefix_for(platform)}_{peer_id}"
 
 
-def detect_workspace(cfg: dict, role: str, platform: str, fallback: str) -> str:
-    prefix = f"{role}_{agent_prefix_for(platform)}_"
-    for a in cfg.get('agents', {}).get('list', []):
-        if a.get('id', '').startswith(prefix) and a.get('workspace'):
-            return a['workspace']
-    for a in cfg.get('agents', {}).get('list', []):
-        if a.get('id') == role and a.get('workspace'):
-            return a['workspace']
+def is_managed_agent_id(agent_id: str) -> bool:
+    return bool(MANAGED_AGENT_RE.fullmatch(agent_id or ''))
+
+
+def escape_md_cell(value: object) -> str:
+    text = str(value or '')
+    return text.replace('\\', '\\\\').replace('|', '\\|').replace('\n', '<br>')
+
+
+def split_md_row(line: str) -> List[str]:
+    text = line.strip()
+    if text.startswith('|'):
+        text = text[1:]
+    if text.endswith('|'):
+        text = text[:-1]
+
+    parts = []
+    current = []
+    escape = False
+    for char in text:
+        if escape:
+            current.append(char)
+            escape = False
+            continue
+        if char == '\\':
+            escape = True
+            continue
+        if char == '|':
+            parts.append(''.join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if escape:
+        current.append('\\')
+    parts.append(''.join(current).strip())
+    return parts
+
+
+def parse_patterns(text: str) -> List[str]:
+    return [x.strip() for x in (text or '').split(';') if x.strip()]
+
+
+def serialize_patterns(patterns: List[str]) -> str:
+    return ';'.join(dedupe([x.strip() for x in patterns if x and x.strip()]))
+
+
+def detect_workspace(cfg: dict, role_name: str, base_agent_id: str, platform: str, fallback: str) -> str:
+    prefix = f"{role_name}_{agent_prefix_for(platform)}_"
+    for agent in cfg.get('agents', {}).get('list', []):
+        if agent.get('id', '').startswith(prefix) and agent.get('workspace'):
+            return agent['workspace']
+    for agent in cfg.get('agents', {}).get('list', []):
+        if agent.get('id') == base_agent_id and agent.get('workspace'):
+            return agent['workspace']
     return fallback
 
 
@@ -82,44 +190,44 @@ def find_default_guild(cfg: dict) -> Optional[str]:
     for acc_cfg in discord.get('accounts', {}).values():
         if not isinstance(acc_cfg, dict):
             continue
-        for gid in (acc_cfg.get('guilds') or {}).keys():
-            guilds.add(gid)
+        for guild_id in (acc_cfg.get('guilds') or {}).keys():
+            guilds.add(guild_id)
     if guilds:
         return sorted(guilds)[0]
     return None
 
 
 def list_discord_channels(guild_id: str) -> List[dict]:
-    cmd = ['openclaw', 'message', 'channel', 'list', '--channel', 'discord', '--guild-id', guild_id, '--json']
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [RUNTIME.openclaw_bin, 'message', 'channel', 'list', '--channel', 'discord', '--guild-id', guild_id, '--json']
+    p = run(cmd, check=False)
     if p.returncode != 0:
         return []
     text = p.stdout.strip()
     try:
         data = json.loads(text)
     except Exception:
-        m = re.search(r'\{[\s\S]*\}\s*$', text)
-        if not m:
+        match = re.search(r'\{[\s\S]*\}\s*$', text)
+        if not match:
             return []
         try:
-            data = json.loads(m.group(0))
+            data = json.loads(match.group(0))
         except Exception:
             return []
     channels = []
     if isinstance(data, dict):
         channels = (data.get('payload', {}) or {}).get('channels') or data.get('channels') or []
     out = []
-    for c in channels:
+    for channel in channels:
         out.append(
             {
                 'platform': 'discord',
-                'id': str(c.get('id', '')),
-                'name': c.get('name', ''),
-                'type': c.get('type'),
-                'parent_id': c.get('parent_id'),
+                'id': str(channel.get('id', '')),
+                'name': channel.get('name', ''),
+                'type': channel.get('type'),
+                'parent_id': channel.get('parent_id'),
             }
         )
-    return [x for x in out if x['id']]
+    return [item for item in out if item['id']]
 
 
 def list_feishu_groups_from_config(cfg: dict) -> List[dict]:
@@ -127,47 +235,55 @@ def list_feishu_groups_from_config(cfg: dict) -> List[dict]:
     seen: Dict[str, dict] = {}
 
     def add(group_id: str, name: str = ''):
-        gid = normalize_peer_id('feishu', group_id)
-        if not gid or not gid.startswith('oc_'):
+        normalized = normalize_peer_id('feishu', group_id)
+        if not normalized or not normalized.startswith('oc_'):
             return
-        if gid not in seen:
-            seen[gid] = {
+        if normalized not in seen:
+            seen[normalized] = {
                 'platform': 'feishu',
-                'id': gid,
+                'id': normalized,
                 'name': name or '',
             }
-        elif name and not seen[gid].get('name'):
-            seen[gid]['name'] = name
+        elif name and not seen[normalized].get('name'):
+            seen[normalized]['name'] = name
 
-    for gid in (feishu.get('groups') or {}).keys():
-        add(str(gid))
+    for group_id in (feishu.get('groups') or {}).keys():
+        add(str(group_id))
 
     for acc_cfg in (feishu.get('accounts') or {}).values():
         if not isinstance(acc_cfg, dict):
             continue
-        for gid in (acc_cfg.get('groups') or {}).keys():
-            add(str(gid))
-        for gid in (acc_cfg.get('groupAllowFrom') or []):
-            add(str(gid))
+        for group_id in (acc_cfg.get('groups') or {}).keys():
+            add(str(group_id))
+        for group_id in (acc_cfg.get('groupAllowFrom') or []):
+            add(str(group_id))
 
-    for b in cfg.get('bindings', []):
-        match = b.get('match', {})
+    for binding in cfg.get('bindings', []):
+        match = binding.get('match', {})
         peer = match.get('peer', {}) if isinstance(match.get('peer', {}), dict) else {}
         if match.get('channel') == 'feishu' and peer.get('kind') == 'group' and peer.get('id'):
             add(str(peer.get('id')))
 
-    return [seen[k] for k in sorted(seen.keys())]
+    return [seen[key] for key in sorted(seen.keys())]
 
 
 def detect_roles(cfg: dict, requested_roles: List[str]) -> List[dict]:
     agents = cfg.get('agents', {}).get('list', [])
     discord_accounts = cfg.get('channels', {}).get('discord', {}).get('accounts', {})
     feishu_accounts = cfg.get('channels', {}).get('feishu', {}).get('accounts', {})
+
+    role_ids = requested_roles or [
+        agent.get('id', '')
+        for agent in agents
+        if agent.get('id') and not is_managed_agent_id(agent.get('id', ''))
+    ]
+
     out = []
-    for role in requested_roles:
-        agent = next((a for a in agents if a.get('id') == role), None)
+    for role in dedupe(role_ids):
+        agent = next((item for item in agents if item.get('id') == role), None)
         if not agent:
             continue
+        group_chat = agent.get('groupChat', {}) if isinstance(agent.get('groupChat'), dict) else {}
         out.append(
             {
                 'role': role,
@@ -175,6 +291,8 @@ def detect_roles(cfg: dict, requested_roles: List[str]) -> List[dict]:
                 'discord_account': role if role in discord_accounts else '',
                 'feishu_account': role if role in feishu_accounts else '',
                 'default_model': agent.get('model', {}).get('primary', ''),
+                'workspace': agent.get('workspace', ''),
+                'discord_mentions': serialize_patterns(group_chat.get('mentionPatterns') or []),
             }
         )
     return out
@@ -188,212 +306,224 @@ def existing_platform_state(cfg: dict, platform: str, roles: List[dict], guild_i
         channel_root = cfg.get('channels', {}).get('discord', {})
         for role in roles:
             role_id = role['role']
-            acc = role.get('discord_account', '')
-            if not acc:
+            account_id = role.get('discord_account', '')
+            if not account_id:
                 continue
             guild_cfg = (
-                (((channel_root.get('accounts', {}) or {}).get(acc, {}) or {}).get('guilds', {}) or {})
+                (((channel_root.get('accounts', {}) or {}).get(account_id, {}) or {}).get('guilds', {}) or {})
             ).get(guild_id, {})
             channels_cfg = guild_cfg.get('channels', {}) or {}
-            for b in bindings:
-                m = b.get('match', {})
-                peer = m.get('peer', {}) if isinstance(m.get('peer', {}), dict) else {}
-                if m.get('channel') != 'discord' or m.get('accountId') != acc:
+            for binding in bindings:
+                match = binding.get('match', {})
+                peer = match.get('peer', {}) if isinstance(match.get('peer', {}), dict) else {}
+                if match.get('channel') != 'discord' or match.get('accountId') != account_id:
                     continue
                 if peer.get('kind') != 'channel' or not peer.get('id'):
                     continue
-                cid = str(peer['id'])
-                state.setdefault(cid, {'roles': {}, 'bound_roles': []})
-                state[cid]['bound_roles'].append(role_id)
-                state[cid]['roles'][role_id] = {
-                    'agentId': b.get('agentId', ''),
-                    'requireMention': channels_cfg.get(cid, {}).get('requireMention', True),
-                    'allow': channels_cfg.get(cid, {}).get('allow', True),
+                channel_id = str(peer['id'])
+                state.setdefault(channel_id, {'roles': {}, 'bound_roles': []})
+                state[channel_id]['bound_roles'].append(role_id)
+                state[channel_id]['roles'][role_id] = {
+                    'agentId': binding.get('agentId', ''),
+                    'requireMention': channels_cfg.get(channel_id, {}).get('requireMention', True),
+                    'allow': channels_cfg.get(channel_id, {}).get('allow', True),
                 }
     elif platform == 'feishu':
         channel_root = cfg.get('channels', {}).get('feishu', {})
         for role in roles:
             role_id = role['role']
-            acc = role.get('feishu_account', '')
-            if not acc:
+            account_id = role.get('feishu_account', '')
+            if not account_id:
                 continue
-            acc_cfg = ((channel_root.get('accounts', {}) or {}).get(acc, {}) or {})
+            acc_cfg = ((channel_root.get('accounts', {}) or {}).get(account_id, {}) or {})
             groups_cfg = acc_cfg.get('groups', {}) or {}
-            for b in bindings:
-                m = b.get('match', {})
-                peer = m.get('peer', {}) if isinstance(m.get('peer', {}), dict) else {}
-                if m.get('channel') != 'feishu' or m.get('accountId') != acc:
+            for binding in bindings:
+                match = binding.get('match', {})
+                peer = match.get('peer', {}) if isinstance(match.get('peer', {}), dict) else {}
+                if match.get('channel') != 'feishu' or match.get('accountId') != account_id:
                     continue
                 if peer.get('kind') != 'group' or not peer.get('id'):
                     continue
-                cid = str(peer['id'])
-                state.setdefault(cid, {'roles': {}, 'bound_roles': []})
-                state[cid]['bound_roles'].append(role_id)
-                state[cid]['roles'][role_id] = {
-                    'agentId': b.get('agentId', ''),
-                    'requireMention': groups_cfg.get(cid, {}).get('requireMention', True),
+                group_id = str(peer['id'])
+                state.setdefault(group_id, {'roles': {}, 'bound_roles': []})
+                state[group_id]['bound_roles'].append(role_id)
+                state[group_id]['roles'][role_id] = {
+                    'agentId': binding.get('agentId', ''),
+                    'requireMention': groups_cfg.get(group_id, {}).get('requireMention', True),
                     'allow': True,
                 }
+
+    for target in state.values():
+        target['bound_roles'] = dedupe(target.get('bound_roles', []))
     return state
 
 
-def suggest_setup(platform: str, name: str, item_type: int, currently_enabled: bool):
-    n = (name or '').lower()
-    if platform == 'discord':
-        if item_type in (4, 2):
-            return 'no', 'trouble,friday', 'true', '容器/语音频道，默认不启用'
-        if '小助理' in name:
-            return 'yes', 'trouble', 'false', '个人助理频道，建议 Trouble 免 mention'
-        if '记账' in name or '收纳' in name or 'flomo' in name:
-            return 'yes', 'trouble', 'true', '工具型频道，建议单 Agent + mention 触发'
-        if '运维' in name or 'backup' in n or 'hippocore' in n:
-            return 'yes', 'friday', 'false', '工程/运维频道，建议 Friday 主负责'
-        if 'research' in n:
-            return 'yes', 'trouble,friday', 'trouble=false;friday=true', '研究频道，Trouble 前台，Friday 被叫起执行'
-        if '灵魂对话' in name or '大总管' in name:
-            return 'yes', 'trouble,friday', 'true', '双 Agent 协作主场，建议都需 mention'
-        if currently_enabled:
-            return 'yes', 'trouble,friday', 'true', '已存在绑定，建议先保持现状'
-        return 'no', 'trouble,friday', 'true', '默认未启用；按需开启'
-
-    if '记账' in name or '收纳' in name or 'flomo' in name:
-        return 'yes', 'trouble', 'true', '工具型飞书群，建议单 Agent + mention 触发'
-    if '情报' in name or 'report' in n:
-        return 'yes', 'trouble', 'true', '收报/同步群，建议 mention 触发避免刷屏'
+def suggest_setup(platform: str, item_type: int, currently_enabled: bool) -> Tuple[str, str, str, str]:
     if currently_enabled:
-        return 'yes', 'trouble,friday', 'true', '已存在绑定，建议先保持现状'
-    return 'no', 'trouble,friday', 'true', '默认未启用；按需开启'
+        return 'yes', '', 'true', 'Existing binding detected; review before applying changes.'
+    if platform == 'discord' and item_type in (2, 4):
+        return 'no', '', 'true', 'Category or voice channel; left disabled by default.'
+    return 'no', '', 'true', 'Disabled by default; choose roles and review mention policy manually.'
 
 
 def generate_draft(cfg: dict, guild_id: str, roles_csv: str, platforms_csv: str):
-    roles = [x.strip() for x in roles_csv.split(',') if x.strip()] or DEFAULT_ROLES
-    platforms = [x.strip() for x in platforms_csv.split(',') if x.strip()] or ['discord', 'feishu']
-    platforms = [p for p in platforms if p in SUPPORTED_PLATFORMS]
+    roles = detect_roles(cfg, parse_csv(roles_csv))
+    if not roles:
+        raise RuntimeError('No matching base roles found in agents.list')
+
+    platforms = parse_csv(platforms_csv) or ['discord', 'feishu']
+    platforms = [platform for platform in platforms if platform in SUPPORTED_PLATFORMS]
     if not platforms:
         raise RuntimeError('No supported platforms requested')
-
-    role_specs = detect_roles(cfg, roles)
-    if not role_specs:
-        raise RuntimeError('No matching base roles found in agents.list')
 
     discord_channels = list_discord_channels(guild_id) if 'discord' in platforms else []
     feishu_groups = list_feishu_groups_from_config(cfg) if 'feishu' in platforms else []
 
-    discord_map = {c['id']: c for c in discord_channels}
-    feishu_map = {c['id']: c for c in feishu_groups}
-    discord_state = existing_platform_state(cfg, 'discord', role_specs, guild_id)
-    feishu_state = existing_platform_state(cfg, 'feishu', role_specs)
+    discord_map = {channel['id']: channel for channel in discord_channels}
+    feishu_map = {group['id']: group for group in feishu_groups}
+    discord_state = existing_platform_state(cfg, 'discord', roles, guild_id)
+    feishu_state = existing_platform_state(cfg, 'feishu', roles)
 
     known_items: List[dict] = []
-    for cid in sorted(set(discord_map.keys()) | set(discord_state.keys())):
-        item = dict(discord_map.get(cid, {'platform': 'discord', 'id': cid, 'name': 'unknown', 'type': 0}))
+    for channel_id in sorted(set(discord_map.keys()) | set(discord_state.keys())):
+        item = dict(discord_map.get(channel_id, {'platform': 'discord', 'id': channel_id, 'name': 'unknown', 'type': 0}))
         known_items.append(item)
-    for gid in sorted(set(feishu_map.keys()) | set(feishu_state.keys())):
-        item = dict(feishu_map.get(gid, {'platform': 'feishu', 'id': gid, 'name': ''}))
+    for group_id in sorted(set(feishu_map.keys()) | set(feishu_state.keys())):
+        item = dict(feishu_map.get(group_id, {'platform': 'feishu', 'id': group_id, 'name': ''}))
         known_items.append(item)
 
-    lines = []
-    lines.append('# Team Setup Draft')
-    lines.append('')
-    lines.append(f'- generated_at: {now_str()}')
-    lines.append('- mode: draft')
-    lines.append(f'- guild_id: {guild_id}')
-    lines.append(f'- platforms: {",".join(platforms)}')
-    lines.append('')
-    lines.append('## Global Policies')
-    lines.append('- default_require_mention: true')
-    lines.append('- allow_bot_to_bot: true')
-    lines.append('- create_per_group_agents: true')
-    lines.append('- isolate_group_context: true')
-    lines.append('- naming_pattern_discord: {role}_ch_{peer_id}')
-    lines.append('- naming_pattern_feishu: {role}_fg_{peer_id}')
-    lines.append('')
-    lines.append('## Roles')
-    lines.append('| role | base_agent_id | discord_account | feishu_account | default_model |')
-    lines.append('|------|---------------|-----------------|----------------|---------------|')
-    for r in role_specs:
+    lines = [
+        '# Team Setup Draft',
+        '',
+        f'- generated_at: {now_str()}',
+        '- mode: draft',
+        f'- guild_id: {guild_id}',
+        f'- platforms: {",".join(platforms)}',
+        '',
+        '## Global Policies',
+        '- default_require_mention: true',
+        '- allow_bot_to_bot: true',
+        '- create_per_group_agents: true',
+        '- isolate_group_context: true',
+        '- naming_pattern_discord: {role}_ch_{peer_id}',
+        '- naming_pattern_feishu: {role}_fg_{peer_id}',
+        '',
+        '## Roles',
+        '| role | base_agent_id | discord_account | feishu_account | default_model | workspace | discord_mentions |',
+        '|------|---------------|-----------------|----------------|---------------|-----------|------------------|',
+    ]
+
+    for role in roles:
         lines.append(
-            f"| {r['role']} | {r['base_agent_id']} | {r['discord_account']} | {r['feishu_account']} | {r['default_model']} |"
+            "| {} | {} | {} | {} | {} | {} | {} |".format(
+                escape_md_cell(role['role']),
+                escape_md_cell(role['base_agent_id']),
+                escape_md_cell(role['discord_account']),
+                escape_md_cell(role['feishu_account']),
+                escape_md_cell(role['default_model']),
+                escape_md_cell(role.get('workspace', '')),
+                escape_md_cell(role.get('discord_mentions', '')),
+            )
         )
-    lines.append('')
-    lines.append('## Targets')
-    lines.append('| platform | peer_id | target_name | enable | roles | require_mention | custom_models | notes |')
-    lines.append('|----------|---------|-------------|--------|-------|-----------------|--------------|------|')
+
+    lines.extend(
+        [
+            '',
+            '## Targets',
+            '| platform | peer_id | target_name | enable | roles | require_mention | custom_models | notes |',
+            '|----------|---------|-------------|--------|-------|-----------------|--------------|------|',
+        ]
+    )
 
     for item in known_items:
         platform = item['platform']
-        pid = item['id']
+        peer_id = item['id']
         state = discord_state if platform == 'discord' else feishu_state
-        st = state.get(pid, {})
-        roles_here = st.get('bound_roles', [])
+        target_state = state.get(peer_id, {})
+        roles_here = target_state.get('bound_roles', [])
         if roles_here:
             enable = 'yes'
             role_text = ','.join(roles_here)
-            vals = []
+            values = []
             per_role = []
-            for role in roles_here:
-                rv = str(st.get('roles', {}).get(role, {}).get('requireMention', True)).lower()
-                vals.append(rv)
-                per_role.append(f"{role}={rv}")
-            req = vals[0] if len(set(vals)) == 1 else ';'.join(per_role)
-            notes = '已存在绑定，按当前线上配置生成'
+            for role_name in roles_here:
+                require_mention = str(target_state.get('roles', {}).get(role_name, {}).get('requireMention', True)).lower()
+                values.append(require_mention)
+                per_role.append(f"{role_name}={require_mention}")
+            req = values[0] if len(set(values)) == 1 else ';'.join(per_role)
+            notes = 'Existing binding detected; generated from current config.'
         else:
-            enable, role_text, req, notes = suggest_setup(platform, item.get('name', 'unknown'), item.get('type', 0), False)
+            enable, role_text, req, notes = suggest_setup(platform, item.get('type', 0), False)
         lines.append(
-            f"| {platform} | {pid} | {item.get('name','')} | {enable} | {role_text} | {req} |  | {notes} |"
+            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                escape_md_cell(platform),
+                escape_md_cell(peer_id),
+                escape_md_cell(item.get('name', '')),
+                escape_md_cell(enable),
+                escape_md_cell(role_text),
+                escape_md_cell(req),
+                '',
+                escape_md_cell(notes),
+            )
         )
 
-    lines.append('')
-    lines.append('## How to Apply')
-    lines.append('1. Edit the Targets table: mark enable=yes/no, choose roles, set require_mention.')
-    lines.append('2. `require_mention` supports either a single value like `true` / `false`, or per-role values like `trouble=false;friday=true`.')
-    lines.append('3. `custom_models` format: `trouble=rightcode/gpt-5.4;friday=rightcode/gpt-5.4-codex`.')
-    lines.append('4. `platform` currently supports `discord` and `feishu`.')
-    lines.append('5. For Feishu, `peer_id` supports either `oc_xxx` or `chat:oc_xxx`; it will be normalized on apply.')
-    lines.append('6. Keep table headers unchanged.')
-    lines.append(
-        f'7. Run: `python3 {WORKSPACE}/scripts/discord_team_bootstrap.py apply --validate`'
+    lines.extend(
+        [
+            '',
+            '## How to Apply',
+            '1. Review the Roles table first. Fill in any missing account ids, workspace paths, or Discord mention patterns.',
+            '2. In ## Targets, set enable=yes/no, choose roles, and set require_mention.',
+            '3. require_mention supports either a single value like true/false, or per-role values like role-a=false;role-b=true.',
+            '4. custom_models format: role=model;role=model.',
+            '5. platform currently supports discord and feishu.',
+            '6. For Feishu, peer_id supports either oc_xxx or chat:oc_xxx; it will be normalized on apply.',
+            '7. Keep the table headers unchanged.',
+            f'8. Run: `python3 {RUNTIME.skill_dir / "scripts/discord_team_bootstrap.py"} apply --validate`',
+        ]
     )
-    DRAFT_PATH.write_text('\n'.join(lines) + '\n')
-    return role_specs, known_items, platforms
+
+    RUNTIME.draft_path.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME.draft_path.write_text('\n'.join(lines) + '\n')
+    return roles, known_items, platforms
 
 
 def parse_md_table(lines: List[str], section_name: str) -> List[Dict[str, str]]:
     start = None
-    for i, line in enumerate(lines):
+    for index, line in enumerate(lines):
         if line.strip() == section_name:
-            start = i + 1
+            start = index + 1
             break
     if start is None:
         return []
+
     table = []
     headers = None
     for line in lines[start:]:
-        s = line.strip()
-        if not s:
+        stripped = line.strip()
+        if not stripped:
             if headers:
                 break
             continue
-        if not s.startswith('|'):
+        if not stripped.startswith('|'):
             if headers:
                 break
             continue
-        parts = [p.strip() for p in s.strip('|').split('|')]
+        parts = split_md_row(stripped)
         if headers is None:
             headers = parts
             continue
-        if all(re.fullmatch(r'-+', p.replace(':', '').strip()) for p in parts):
+        if all(re.fullmatch(r'-+', cell.replace(':', '').strip()) for cell in parts):
             continue
-        row = {headers[i]: parts[i] if i < len(parts) else '' for i in range(len(headers))}
+        row = {headers[index]: parts[index] if index < len(parts) else '' for index in range(len(headers))}
         table.append(row)
     return table
 
 
-def parse_bool(v: str, default: bool = True) -> bool:
-    t = (v or '').strip().lower()
-    if t in {'true', 'yes', 'y', '1'}:
+def parse_bool(value: str, default: bool = True) -> bool:
+    normalized = (value or '').strip().lower()
+    if normalized in {'true', 'yes', 'y', '1'}:
         return True
-    if t in {'false', 'no', 'n', '0'}:
+    if normalized in {'false', 'no', 'n', '0'}:
         return False
     return default
 
@@ -402,58 +532,58 @@ def parse_custom_models(text: str) -> Dict[str, str]:
     out = {}
     for part in [x.strip() for x in (text or '').split(';') if x.strip()]:
         if '=' in part:
-            k, v = part.split('=', 1)
-            out[k.strip()] = v.strip()
+            key, value = part.split('=', 1)
+            out[key.strip()] = value.strip()
     return out
 
 
 def parse_require_mention_map(text: str, roles_here: List[str], default: bool = True) -> Dict[str, bool]:
     raw = (text or '').strip()
     if not raw:
-        return {r: default for r in roles_here}
-    low = raw.lower()
-    if low in {'true', 'false', 'yes', 'no', 'y', 'n', '1', '0'}:
-        val = parse_bool(low, default)
-        return {r: val for r in roles_here}
+        return {role: default for role in roles_here}
+    normalized = raw.lower()
+    if normalized in {'true', 'false', 'yes', 'no', 'y', 'n', '1', '0'}:
+        value = parse_bool(normalized, default)
+        return {role: value for role in roles_here}
 
-    out = {r: default for r in roles_here}
+    out = {role: default for role in roles_here}
     for part in [x.strip() for x in raw.split(';') if x.strip()]:
         if '=' not in part:
             continue
-        k, v = part.split('=', 1)
-        role = k.strip()
+        key, value = part.split('=', 1)
+        role = key.strip()
         if role in out:
-            out[role] = parse_bool(v.strip(), default)
+            out[role] = parse_bool(value.strip(), default)
     return out
 
 
-def mention_patterns_for_role(role: str) -> List[str]:
-    rid = role.lower()
-    patterns = [rf'(?<!\\d)@?{re.escape(rid)}(?!\\d)']
-    if rid == 'friday':
-        patterns.append(r'<@!?1473334758372016128>')
-    if rid == 'trouble':
-        patterns.append(r'<@!?1469167632165900465>')
-    return patterns
+def mention_patterns_for_role(role: dict) -> List[str]:
+    configured = parse_patterns(role.get('discord_mentions', ''))
+    if configured:
+        return dedupe(configured)
+    role_id = role['role'].lower()
+    return [rf'(?<!\\d)@?{re.escape(role_id)}(?!\\d)']
 
 
 def ensure_feishu_group_allowlisted(feishu_node: dict, group_id: str):
     if feishu_node.get('groupPolicy') == 'allowlist':
-        cur = feishu_node.get('groupAllowFrom')
-        if not isinstance(cur, list):
+        current = feishu_node.get('groupAllowFrom')
+        if not isinstance(current, list):
             feishu_node['groupAllowFrom'] = []
-            cur = feishu_node['groupAllowFrom']
-        if group_id not in cur:
-            cur.append(group_id)
+            current = feishu_node['groupAllowFrom']
+        if group_id not in current:
+            current.append(group_id)
 
 
-def parse_draft(cfg: dict) -> Tuple[List[dict], List[dict], str]:
-    if not DRAFT_PATH.exists():
-        raise RuntimeError(f'Draft not found: {DRAFT_PATH}')
-    lines = DRAFT_PATH.read_text().splitlines()
+def parse_draft() -> Tuple[List[dict], List[dict], str]:
+    if not RUNTIME.draft_path.exists():
+        raise RuntimeError(f'Draft not found: {RUNTIME.draft_path}')
+
+    raw_text = RUNTIME.draft_path.read_text()
+    lines = raw_text.splitlines()
     role_rows = parse_md_table(lines, '## Roles')
     target_rows = parse_md_table(lines, '## Targets')
-    guild_match = re.search(r'^- guild_id: (.+)$', DRAFT_PATH.read_text(), re.M)
+    guild_match = re.search(r'^\s*-\s*guild_id:\s*(.+)$', raw_text, re.M)
     if not guild_match:
         raise RuntimeError('guild_id missing from draft')
     guild_id = guild_match.group(1).strip()
@@ -467,9 +597,11 @@ def parse_draft(cfg: dict) -> Tuple[List[dict], List[dict], str]:
                 'discord_account': row.get('discord_account', '').strip(),
                 'feishu_account': row.get('feishu_account', '').strip(),
                 'default_model': row.get('default_model', '').strip(),
+                'workspace': row.get('workspace', '').strip(),
+                'discord_mentions': row.get('discord_mentions', '').strip(),
             }
         )
-    roles = [r for r in roles if r['role'] and r['base_agent_id']]
+    roles = [role for role in roles if role['role'] and role['base_agent_id']]
     if not roles:
         raise RuntimeError('No valid roles parsed from draft')
 
@@ -480,13 +612,13 @@ def parse_draft(cfg: dict) -> Tuple[List[dict], List[dict], str]:
             continue
         if not parse_bool(row.get('enable', 'no'), False):
             continue
-        pid = normalize_peer_id(platform, row.get('peer_id', '').strip())
-        if not pid:
+        peer_id = normalize_peer_id(platform, row.get('peer_id', '').strip())
+        if not peer_id:
             continue
         managed_targets.append(
             {
                 'platform': platform,
-                'peer_id': pid,
+                'peer_id': peer_id,
                 'target_name': row.get('target_name', '').strip(),
                 'roles': [x.strip() for x in row.get('roles', '').split(',') if x.strip()],
                 'require_mention': row.get('require_mention', '').strip(),
@@ -497,70 +629,100 @@ def parse_draft(cfg: dict) -> Tuple[List[dict], List[dict], str]:
     return roles, managed_targets, guild_id
 
 
+def validate_draft(roles: List[dict], managed_targets: List[dict]) -> Dict[str, dict]:
+    role_map = {}
+    errors = []
+
+    for role in roles:
+        role_name = role['role']
+        if role_name in role_map:
+            errors.append(f'duplicate role "{role_name}" in Roles table')
+            continue
+        role_map[role_name] = role
+
+    for target in managed_targets:
+        label = f"[{target['platform']}] {target['peer_id']}"
+        if not target['roles']:
+            errors.append(f'{label} has enable=yes but no roles selected')
+            continue
+        for role_name in target['roles']:
+            role = role_map.get(role_name)
+            if not role:
+                errors.append(f'{label} references unknown role "{role_name}"')
+                continue
+            if target['platform'] == 'discord' and not role.get('discord_account'):
+                errors.append(f'{label} uses role "{role_name}" without discord_account in Roles table')
+            if target['platform'] == 'feishu' and not role.get('feishu_account'):
+                errors.append(f'{label} uses role "{role_name}" without feishu_account in Roles table')
+
+    if errors:
+        raise RuntimeError('Invalid draft:\n- ' + '\n- '.join(errors))
+    return role_map
+
+
+def resolve_role_workspace(cfg: dict, role: dict, platform: str) -> str:
+    if role.get('workspace'):
+        return role['workspace']
+    return detect_workspace(cfg, role['role'], role['base_agent_id'], platform, RUNTIME.fallback_workspace)
+
+
 def apply_from_draft(cfg: dict):
-    roles, managed_targets, guild_id = parse_draft(cfg)
+    roles, managed_targets, guild_id = parse_draft()
+    role_map = validate_draft(roles, managed_targets)
 
     keep_agents = []
-    for a in cfg.get('agents', {}).get('list', []):
-        aid = a.get('id', '')
-        if any(aid.startswith(f"{role['role']}_ch_") or aid.startswith(f"{role['role']}_fg_") for role in roles):
+    for agent in cfg.get('agents', {}).get('list', []):
+        agent_id = agent.get('id', '')
+        if any(agent_id.startswith(f"{role['role']}_ch_") or agent_id.startswith(f"{role['role']}_fg_") for role in roles):
             continue
-        keep_agents.append(a)
+        keep_agents.append(agent)
 
     for target in managed_targets:
         platform = target['platform']
-        custom = parse_custom_models(target['custom_models'])
-        for role in roles:
-            if role['role'] not in target['roles']:
-                continue
-            if platform == 'discord' and not role.get('discord_account'):
-                continue
-            if platform == 'feishu' and not role.get('feishu_account'):
-                continue
-            aid = make_agent_id(role['role'], platform, target['peer_id'])
-            workspace = detect_workspace(
-                cfg,
-                role['role'],
-                platform,
-                '/root/clawd-agent2' if role['role'] == 'friday' else '/root/clawd',
-            )
+        custom_models = parse_custom_models(target['custom_models'])
+        for role_name in target['roles']:
+            role = role_map[role_name]
             agent = {
-                'id': aid,
-                'name': f"{role['role']}@{platform}#{target['peer_id']}",
-                'workspace': workspace,
-                'model': {'primary': custom.get(role['role'], role['default_model'])},
+                'id': make_agent_id(role_name, platform, target['peer_id']),
+                'name': f"{role_name}@{platform}#{target['peer_id']}",
+                'workspace': resolve_role_workspace(cfg, role, platform),
+                'model': {'primary': custom_models.get(role_name, role['default_model'])},
             }
             if platform == 'discord':
-                agent['groupChat'] = {'mentionPatterns': mention_patterns_for_role(role['role'])}
+                patterns = mention_patterns_for_role(role)
+                if patterns:
+                    agent['groupChat'] = {'mentionPatterns': patterns}
             keep_agents.append(agent)
 
-    for a in keep_agents:
-        if a.get('id') in [r['base_agent_id'] for r in roles]:
-            gc = a.setdefault('groupChat', {})
-            cur = list(gc.get('mentionPatterns') or [])
-            role = a.get('id')
-            merged = []
-            for x in cur + mention_patterns_for_role(role):
-                if x not in merged:
-                    merged.append(x)
-            gc['mentionPatterns'] = merged
+    base_role_map = {role['base_agent_id']: role for role in roles}
+    for agent in keep_agents:
+        agent_id = agent.get('id')
+        role = base_role_map.get(agent_id)
+        if not role:
+            continue
+        patterns = mention_patterns_for_role(role)
+        if not patterns:
+            continue
+        group_chat = agent.setdefault('groupChat', {})
+        current = list(group_chat.get('mentionPatterns') or [])
+        group_chat['mentionPatterns'] = dedupe(current + patterns)
 
     cfg.setdefault('agents', {})['list'] = keep_agents
 
     new_bindings = []
-    for b in cfg.get('bindings', []):
-        m = b.get('match', {})
-        peer = m.get('peer', {}) if isinstance(m.get('peer', {}), dict) else {}
-        aid = b.get('agentId', '')
-        if m.get('channel') == 'discord' and peer.get('kind') == 'channel' and any(
-            aid.startswith(f"{role['role']}_ch_") for role in roles
+    for binding in cfg.get('bindings', []):
+        match = binding.get('match', {})
+        peer = match.get('peer', {}) if isinstance(match.get('peer', {}), dict) else {}
+        agent_id = binding.get('agentId', '')
+        if match.get('channel') == 'discord' and peer.get('kind') == 'channel' and any(
+            agent_id.startswith(f"{role['role']}_ch_") for role in roles
         ):
             continue
-        if m.get('channel') == 'feishu' and peer.get('kind') == 'group' and any(
-            aid.startswith(f"{role['role']}_fg_") for role in roles
+        if match.get('channel') == 'feishu' and peer.get('kind') == 'group' and any(
+            agent_id.startswith(f"{role['role']}_fg_") for role in roles
         ):
             continue
-        new_bindings.append(b)
+        new_bindings.append(binding)
 
     discord = cfg.setdefault('channels', {}).setdefault('discord', {})
     feishu = cfg.setdefault('channels', {}).setdefault('feishu', {})
@@ -569,29 +731,25 @@ def apply_from_draft(cfg: dict):
 
     for role in roles:
         if role.get('discord_account'):
-            acc = discord_accounts.setdefault(role['discord_account'], {})
-            acc['allowBots'] = True
-            guilds = acc.setdefault('guilds', {})
-            g = guilds.setdefault(guild_id, {})
-            g['requireMention'] = True
-            if not isinstance(g.get('channels'), dict):
-                g['channels'] = {}
+            account = discord_accounts.setdefault(role['discord_account'], {})
+            account['allowBots'] = True
+            guilds = account.setdefault('guilds', {})
+            guild = guilds.setdefault(guild_id, {})
+            guild['requireMention'] = True
+            if not isinstance(guild.get('channels'), dict):
+                guild['channels'] = {}
         if role.get('feishu_account'):
-            acc = feishu_accounts.setdefault(role['feishu_account'], {})
-            if not isinstance(acc.get('groups'), dict):
-                acc['groups'] = {}
+            account = feishu_accounts.setdefault(role['feishu_account'], {})
+            if not isinstance(account.get('groups'), dict):
+                account['groups'] = {}
 
     for target in managed_targets:
         platform = target['platform']
-        req_map = parse_require_mention_map(target['require_mention'], target['roles'], True)
-        for role in roles:
-            role_name = role['role']
-            if role_name not in target['roles']:
-                continue
+        require_mention = parse_require_mention_map(target['require_mention'], target['roles'], True)
+        for role_name in target['roles']:
+            role = role_map[role_name]
             if platform == 'discord':
-                account_id = role.get('discord_account', '')
-                if not account_id:
-                    continue
+                account_id = role['discord_account']
                 new_bindings.append(
                     {
                         'agentId': make_agent_id(role_name, 'discord', target['peer_id']),
@@ -604,12 +762,10 @@ def apply_from_draft(cfg: dict):
                 )
                 discord_accounts[account_id]['guilds'][guild_id]['channels'][target['peer_id']] = {
                     'allow': True,
-                    'requireMention': req_map.get(role_name, True),
+                    'requireMention': require_mention.get(role_name, True),
                 }
-            elif platform == 'feishu':
-                account_id = role.get('feishu_account', '')
-                if not account_id:
-                    continue
+            else:
+                account_id = role['feishu_account']
                 new_bindings.append(
                     {
                         'agentId': make_agent_id(role_name, 'feishu', target['peer_id']),
@@ -620,76 +776,136 @@ def apply_from_draft(cfg: dict):
                         },
                     }
                 )
-                acc = feishu_accounts[account_id]
-                groups = acc.setdefault('groups', {})
-                cur = groups.get(target['peer_id'], {}) if isinstance(groups.get(target['peer_id']), dict) else {}
-                cur['requireMention'] = req_map.get(role_name, True)
-                groups[target['peer_id']] = cur
-                ensure_feishu_group_allowlisted(acc, target['peer_id'])
+                account = feishu_accounts[account_id]
+                groups = account.setdefault('groups', {})
+                current = groups.get(target['peer_id'], {}) if isinstance(groups.get(target['peer_id']), dict) else {}
+                current['requireMention'] = require_mention.get(role_name, True)
+                groups[target['peer_id']] = current
+                ensure_feishu_group_allowlisted(account, target['peer_id'])
                 ensure_feishu_group_allowlisted(feishu, target['peer_id'])
 
-    discord.setdefault('guilds', {}).setdefault(guild_id, {})['channels'] = {
-        '*': {'allow': True, 'requireMention': True}
-    }
+    guilds = discord.setdefault('guilds', {})
+    guild = guilds.setdefault(guild_id, {})
+    channels = guild.get('channels')
+    if not isinstance(channels, dict):
+        channels = {}
+    channels['*'] = {'allow': True, 'requireMention': True}
+    guild['channels'] = channels
+
     cfg['bindings'] = new_bindings
     return cfg, roles, managed_targets, guild_id
 
 
+def build_inspect_report(cfg: dict) -> str:
+    roles, managed_targets, guild_id = parse_draft()
+    role_map = validate_draft(roles, managed_targets)
+    states = {
+        'discord': existing_platform_state(cfg, 'discord', roles, guild_id),
+        'feishu': existing_platform_state(cfg, 'feishu', roles),
+    }
+    agent_ids = {agent.get('id', '') for agent in cfg.get('agents', {}).get('list', [])}
+
+    report = ['# Inspect Report', f'- guild_id: {guild_id or "-"}', f'- roles: {", ".join(role_map.keys())}', '']
+
+    for target in managed_targets:
+        expected_roles = target['roles']
+        current = states[target['platform']].get(target['peer_id'], {'bound_roles': [], 'roles': {}})
+        actual_roles = dedupe(current.get('bound_roles', []))
+        missing_roles = [role for role in expected_roles if role not in actual_roles]
+        extra_roles = [role for role in actual_roles if role not in expected_roles]
+        target_status = 'ok' if not missing_roles and not extra_roles else 'mismatch'
+        report.append(
+            f"- [{target['platform']}] {target['peer_id']} {target['target_name']}: status={target_status} expected_roles={','.join(expected_roles)} actual_roles={','.join(actual_roles) or '-'}"
+        )
+        if missing_roles:
+            report.append(f"  missing_roles: {', '.join(missing_roles)}")
+        if extra_roles:
+            report.append(f"  extra_roles: {', '.join(extra_roles)}")
+
+        require_mention = parse_require_mention_map(target['require_mention'], expected_roles, True)
+        for role_name in expected_roles:
+            expected_agent_id = make_agent_id(role_name, target['platform'], target['peer_id'])
+            actual = current.get('roles', {}).get(role_name)
+            issues = []
+            if expected_agent_id not in agent_ids:
+                issues.append('agent missing')
+            if not actual:
+                issues.append('binding missing')
+            else:
+                if actual.get('agentId') and actual['agentId'] != expected_agent_id:
+                    issues.append(f"binding agentId={actual['agentId']}")
+                actual_require = actual.get('requireMention', True)
+                expected_require = require_mention.get(role_name, True)
+                if actual_require != expected_require:
+                    issues.append(f"requireMention={actual_require} expected={expected_require}")
+            status = 'ok' if not issues else 'mismatch'
+            report.append(
+                f"  role={role_name} status={status} expected_agent={expected_agent_id} expected_require_mention={require_mention.get(role_name, True)} issues={'; '.join(issues) or '-'}"
+            )
+        report.append('')
+
+    return '\n'.join(report).rstrip() + '\n'
+
+
 def write_report(text: str):
-    REPORT_PATH.write_text(text)
+    RUNTIME.report_path.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME.report_path.write_text(text)
 
 
 def cmd_scan(args):
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_json(RUNTIME.config_path)
     guild_id = args.guild_id or find_default_guild(cfg)
-    if 'discord' in args.platforms.split(',') and not guild_id:
+    if 'discord' in parse_csv(args.platforms) and not guild_id:
         raise RuntimeError('No Discord guild found; pass --guild-id explicitly')
     roles, items, platforms = generate_draft(cfg, guild_id or '', args.roles, args.platforms)
-    msg = []
-    msg.append('✅ Draft generated')
-    msg.append(f'- guild_id: {guild_id or "-"}')
-    msg.append(f'- platforms: {", ".join(platforms)}')
-    msg.append(f'- roles: {", ".join(r["role"] for r in roles)}')
-    msg.append(f'- targets discovered: {len(items)}')
-    msg.append(f'- draft: {DRAFT_PATH}')
-    out = '\n'.join(msg) + '\n'
-    write_report(out)
-    print(out)
+    message = [
+        'Draft generated',
+        f'- guild_id: {guild_id or "-"}',
+        f'- platforms: {", ".join(platforms)}',
+        f'- roles: {", ".join(role["role"] for role in roles)}',
+        f'- targets discovered: {len(items)}',
+        f'- draft: {RUNTIME.draft_path}',
+    ]
+    text = '\n'.join(message) + '\n'
+    write_report(text)
+    print(text)
 
 
 def cmd_explain(args):
-    if not DRAFT_PATH.exists():
-        raise RuntimeError(f'Draft not found: {DRAFT_PATH}')
-    text = f"""Draft file: {DRAFT_PATH}
+    if not RUNTIME.draft_path.exists():
+        raise RuntimeError(f'Draft not found: {RUNTIME.draft_path}')
+    text = f"""Draft file: {RUNTIME.draft_path}
 
 How to edit:
+- Review ## Roles first and fill in any missing account ids or workspace paths.
 - In ## Targets, set `enable` to yes/no.
 - In `roles`, use comma-separated role ids from ## Roles.
 - `platform` supports `discord` and `feishu`.
 - `require_mention=true` means the bot only replies when mentioned.
 - `custom_models` format: role=model;role=model
 - Feishu `peer_id` may be `oc_xxx` or `chat:oc_xxx`.
-- After editing, run: python3 {WORKSPACE}/scripts/discord_team_bootstrap.py apply --validate
+- After editing, run: python3 {RUNTIME.skill_dir / "scripts/discord_team_bootstrap.py"} apply --validate
 """
     write_report(text)
     print(text)
 
 
 def cmd_apply(args):
-    cfg = load_json(CONFIG_PATH)
-    backup = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + '.bak.discord-team-bootstrap')
-    backup.write_text(CONFIG_PATH.read_text())
+    cfg = load_json(RUNTIME.config_path)
+    backup = RUNTIME.config_path.with_suffix(RUNTIME.config_path.suffix + '.bak.discord-team-bootstrap')
+    backup.write_text(RUNTIME.config_path.read_text())
     try:
         new_cfg, roles, managed_targets, guild_id = apply_from_draft(cfg)
-        report = []
-        report.append('✅ Draft parsed')
-        report.append(f'- guild_id: {guild_id or "-"}')
-        report.append(f'- roles: {", ".join(r["role"] for r in roles)}')
-        report.append(f'- managed_targets: {len(managed_targets)}')
-        report.append('- planned_changes:')
+        report = [
+            'Draft parsed',
+            f'- guild_id: {guild_id or "-"}',
+            f'- roles: {", ".join(role["role"] for role in roles)}',
+            f'- managed_targets: {len(managed_targets)}',
+            '- planned_changes:',
+        ]
         for row in managed_targets:
             report.append(
-                f"  - [{row.get('platform','')}] {row.get('target_name','')} ({row.get('peer_id','')}): roles={','.join(row.get('roles',[]))} require_mention={row.get('require_mention','')} custom_models={row.get('custom_models','') or '-'}"
+                f"  - [{row.get('platform', '')}] {row.get('target_name', '')} ({row.get('peer_id', '')}): roles={','.join(row.get('roles', []))} require_mention={row.get('require_mention', '')} custom_models={row.get('custom_models', '') or '-'}"
             )
 
         if args.dry_run:
@@ -698,67 +914,71 @@ def cmd_apply(args):
             print(text)
             return
 
-        save_json(CONFIG_PATH, new_cfg)
-        report[0] = '✅ Draft applied'
+        save_json(RUNTIME.config_path, new_cfg)
+        report[0] = 'Draft applied'
         if args.validate:
-            v = run(['python3', VALIDATE_SCRIPT], check=False)
-            if v.returncode != 0:
-                raise RuntimeError(f'config validate failed:\n{v.stdout}\n{v.stderr}')
-            h = run(['openclaw', 'gateway', 'health'], check=False)
+            if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
+                raise RuntimeError(
+                    'Validation requested, but validate script was not found. '
+                    'Set --validate-script or OPENCLAW_TEAM_BOOTSTRAP_VALIDATE_SCRIPT.'
+                )
+            validate = run(['python3', str(RUNTIME.validate_script)], check=False)
+            if validate.returncode != 0:
+                raise RuntimeError(f'config validate failed:\n{validate.stdout}\n{validate.stderr}')
+            health = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
             report.append('- validate: ok')
-            report.append(f'- gateway_health_code: {h.returncode}')
-            if h.stdout.strip():
+            report.append(f'- gateway_health_code: {health.returncode}')
+            if health.stdout.strip():
                 report.append('- gateway_health_output:')
-                report.append(h.stdout.strip())
+                report.append(health.stdout.strip())
         report.append(f'- backup: {backup}')
         text = '\n'.join(report) + '\n'
         write_report(text)
         print(text)
     except Exception:
-        CONFIG_PATH.write_text(backup.read_text())
+        RUNTIME.config_path.write_text(backup.read_text())
         raise
 
 
 def cmd_inspect(args):
-    cfg = load_json(CONFIG_PATH)
-    roles, managed_targets, guild_id = parse_draft(cfg)
-    report = []
-    report.append('# Inspect Report')
-    report.append(f'- guild_id: {guild_id or "-"}')
-    report.append(f'- roles: {", ".join(r["role"] for r in roles)}')
-    report.append('')
-    for row in managed_targets:
-        report.append(
-            f"- [{row.get('platform','')}] {row.get('peer_id','')} {row.get('target_name','')}: roles={','.join(row.get('roles',[]))} require_mention={row.get('require_mention','')}"
-        )
-    text = '\n'.join(report) + '\n'
+    cfg = load_json(RUNTIME.config_path)
+    text = build_inspect_report(cfg)
     write_report(text)
     print(text)
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Discord / Feishu multi-agent bootstrap skill')
-    sub = ap.add_subparsers(dest='cmd', required=True)
+    parser = argparse.ArgumentParser(description='Discord / Feishu multi-agent bootstrap skill')
+    parser.add_argument('--skill-dir', default='', help='Skill directory used to resolve default draft/report paths.')
+    parser.add_argument('--draft-path', default='', help='Path to the editable draft markdown file.')
+    parser.add_argument('--report-path', default='', help='Path to the generated report file.')
+    parser.add_argument('--config-path', default='', help='Path to openclaw.json.')
+    parser.add_argument('--validate-script', default='', help='Path to validate-openclaw-config.py.')
+    parser.add_argument('--openclaw-bin', default='', help='OpenClaw CLI executable name or path.')
+    parser.add_argument('--fallback-workspace', default='', help='Fallback workspace for generated agents.')
+    sub = parser.add_subparsers(dest='cmd', required=True)
 
-    p1 = sub.add_parser('scan')
-    p1.add_argument('--guild-id', default='')
-    p1.add_argument('--roles', default='trouble,friday')
-    p1.add_argument('--platforms', default='discord,feishu')
-    p1.set_defaults(func=cmd_scan)
+    scan = sub.add_parser('scan')
+    scan.add_argument('--guild-id', default='')
+    scan.add_argument('--roles', default='', help='Comma-separated base role ids. Defaults to auto-detecting non-generated agents.')
+    scan.add_argument('--platforms', default='discord,feishu')
+    scan.set_defaults(func=cmd_scan)
 
-    p2 = sub.add_parser('explain')
-    p2.set_defaults(func=cmd_explain)
+    explain = sub.add_parser('explain')
+    explain.set_defaults(func=cmd_explain)
 
-    p3 = sub.add_parser('apply')
-    p3.add_argument('--validate', action='store_true')
-    p3.add_argument('--dry-run', action='store_true')
-    p3.set_defaults(func=cmd_apply)
+    apply = sub.add_parser('apply')
+    apply.add_argument('--validate', action='store_true')
+    apply.add_argument('--dry-run', action='store_true')
+    apply.set_defaults(func=cmd_apply)
 
-    p4 = sub.add_parser('inspect')
-    p4.set_defaults(func=cmd_inspect)
+    inspect = sub.add_parser('inspect')
+    inspect.set_defaults(func=cmd_inspect)
 
-    args = ap.parse_args()
-    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    args = parser.parse_args()
+    global RUNTIME
+    RUNTIME = build_runtime(args)
+    RUNTIME.skill_dir.mkdir(parents=True, exist_ok=True)
     args.func(args)
 
 

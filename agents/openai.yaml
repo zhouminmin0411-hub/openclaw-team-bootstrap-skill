@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenClaw Team Bootstrap"
+  short_description: "Bootstrap OpenClaw Discord and Feishu routing"
+  default_prompt: "Use $openclaw-team-bootstrap to scan current OpenClaw routing, draft target bindings, and apply the confirmed config."

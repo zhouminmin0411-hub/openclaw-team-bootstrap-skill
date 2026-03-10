@@ -1,33 +1,65 @@
 # openclaw-team-bootstrap-skill
 
-A reusable OpenClaw skill for bootstrapping and reconfiguring multi-agent team routing across **Discord channels** and **Feishu groups**.
+A reusable OpenClaw skill for bootstrapping and reconfiguring multi-agent routing across Discord channels and Feishu groups.
 
 ## What it does
 
-This skill scans the current OpenClaw environment, generates a human-editable Markdown draft, and then applies the confirmed team routing configuration back into `openclaw.json` with validation and rollback.
+The workflow is draft-driven:
 
-It is designed for users who want a reusable team-initialization workflow without relying on Notion as the source of truth.
+1. Scan the current OpenClaw environment.
+2. Generate a human-editable Markdown draft.
+3. Review and edit roles, targets, mention policy, and per-role models.
+4. Preview or apply the resulting routing changes back into `openclaw.json`.
+
+The script creates a backup before apply, can validate the updated config, and restores the backup automatically if validation fails.
 
 ## Supported platforms
 
 - Discord
 - Feishu
 
-## Key capabilities
+## Public-friendly defaults
 
-- Discover current Discord channels and Feishu groups
-- Generate a unified draft table for team routing targets
-- Configure per-target roles
-- Configure per-role `requireMention` behavior
-- Configure per-role custom models
-- Create per-target agents automatically
-- Write bindings and channel/group config back into `openclaw.json`
-- Validate config before keeping changes
-- Restore backup automatically if validation fails
+This repository no longer assumes a fixed `/root/...` layout.
 
-## Draft fields
+Default runtime paths:
 
-The generated draft contains a `## Targets` table with these columns:
+- Skill directory: the repository root that contains this script
+- Draft file: `team-setup.draft.md`
+- Report file: `team-setup.report.md`
+- OpenClaw config: `~/.openclaw/openclaw.json`
+- Validation script: `~/.openclaw/scripts/validate-openclaw-config.py`
+
+Override any of them with CLI flags or environment variables:
+
+- `--skill-dir` / `OPENCLAW_TEAM_BOOTSTRAP_SKILL_DIR`
+- `--draft-path` / `OPENCLAW_TEAM_BOOTSTRAP_DRAFT_PATH`
+- `--report-path` / `OPENCLAW_TEAM_BOOTSTRAP_REPORT_PATH`
+- `--config-path` / `OPENCLAW_TEAM_BOOTSTRAP_CONFIG_PATH`
+- `--validate-script` / `OPENCLAW_TEAM_BOOTSTRAP_VALIDATE_SCRIPT`
+- `--openclaw-bin` / `OPENCLAW_TEAM_BOOTSTRAP_OPENCLAW_BIN`
+- `--fallback-workspace` / `OPENCLAW_TEAM_BOOTSTRAP_FALLBACK_WORKSPACE`
+
+## Draft format
+
+The generated draft contains:
+
+- `## Roles`
+- `## Targets`
+
+### Roles columns
+
+- `role`
+- `base_agent_id`
+- `discord_account`
+- `feishu_account`
+- `default_model`
+- `workspace`
+- `discord_mentions`
+
+`discord_mentions` accepts `;`-separated regex or mention patterns. If left empty, the script falls back to matching the role name.
+
+### Targets columns
 
 - `platform`
 - `peer_id`
@@ -38,35 +70,36 @@ The generated draft contains a `## Targets` table with these columns:
 - `custom_models`
 - `notes`
 
-### `require_mention`
+`require_mention` supports either:
 
-Supports either:
+- a single boolean: `true` / `false`
+- a per-role mapping: `role-a=false;role-b=true`
 
-- single boolean: `true` / `false`
-- per-role mapping: `trouble=false;friday=true`
-
-### `custom_models`
-
-Format:
+`custom_models` format:
 
 ```text
-trouble=rightcode/gpt-5.4;friday=rightcode/gpt-5.4-codex
+role-a=model-a;role-b=model-b
 ```
-
-## Files
-
-- `SKILL.md` — skill definition and usage guide
-- `scripts/discord_team_bootstrap.py` — main script
 
 ## Usage
 
-### 1. Scan and generate draft
+Run commands from the repository root.
+
+### 1. Generate a draft
 
 ```bash
 python3 scripts/discord_team_bootstrap.py scan --platforms discord,feishu
 ```
 
-### 2. Explain draft
+By default, `scan` auto-detects base roles from `agents.list` and skips generated `*_ch_*` / `*_fg_*` agents. You can pin roles explicitly:
+
+```bash
+python3 scripts/discord_team_bootstrap.py scan \
+  --roles role-a,role-b \
+  --guild-id <discordGuildId>
+```
+
+### 2. Explain the draft
 
 ```bash
 python3 scripts/discord_team_bootstrap.py explain
@@ -84,19 +117,44 @@ python3 scripts/discord_team_bootstrap.py apply --dry-run
 python3 scripts/discord_team_bootstrap.py apply --validate
 ```
 
-### 5. Inspect current draft
+### 5. Inspect drift between draft and current config
 
 ```bash
 python3 scripts/discord_team_bootstrap.py inspect
 ```
 
-## Feishu note
+`inspect` now compares the enabled draft targets with the current config and reports missing roles, missing generated agents, and `requireMention` mismatches.
 
-For Feishu, setting `requireMention=false` only lowers the reply gate. Whether the bot can actually receive all group messages still depends on the app/plugin permissions granted in Feishu.
+## Platform behavior
 
-## Safety
+### Discord
 
-- Creates a backup before apply
-- Restores backup automatically on validation failure
-- Uses dry-run preview mode before real apply
-- Keeps the workflow draft-driven and reviewable
+The script manages:
+
+- generated per-target agents in `agents.list` as `*_ch_<channelId>`
+- Discord channel bindings in `bindings[]`
+- `channels.discord.accounts.<account>.guilds.<guildId>.channels.<channelId>.requireMention`
+- `allowBots=true` for managed Discord accounts
+
+### Feishu
+
+The script manages:
+
+- generated per-target agents in `agents.list` as `*_fg_<groupId>`
+- Feishu group bindings in `bindings[]`
+- `channels.feishu.accounts.<account>.groups.<groupId>.requireMention`
+- `groupAllowFrom` when account-level or top-level Feishu config uses `groupPolicy=allowlist`
+
+Important: on Feishu, `requireMention=false` only lowers the reply gate. Whether the bot can receive all group messages still depends on Feishu-side permissions.
+
+## Validation and safety
+
+- `apply` creates `openclaw.json.bak.discord-team-bootstrap`
+- `apply --validate` runs the validation script, then `openclaw gateway health`
+- if validation fails, the script restores the backup automatically
+- invalid draft rows now fail fast instead of silently skipping targets
+
+## Limits
+
+- Feishu discovery is config-based, not API-based. New groups that have never appeared in config or bindings will not be discovered automatically.
+- Markdown table parsing is intentionally lightweight; keep the table structure unchanged.
