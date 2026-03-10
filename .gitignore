@@ -1,0 +1,5 @@
+# Ignore local/generated artifacts if contributors create them later
+*.report.md
+*.draft.md
+__pycache__/
+*.pyc
