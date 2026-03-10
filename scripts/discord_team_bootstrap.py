@@ -672,7 +672,10 @@ def find_target_in_draft(platform: str, peer_id: str) -> Tuple[List[dict], Optio
 def config_validation_summary() -> Tuple[str, str]:
     if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
         return 'unknown', 'validate script not found'
-    result = run(['python3', str(RUNTIME.validate_script)], check=False)
+    try:
+        result = run(['python3', str(RUNTIME.validate_script)], check=False)
+    except RuntimeError as exc:
+        return 'unknown', str(exc)
     if result.returncode == 0:
         return 'ok', (result.stdout or '').strip() or 'config-check OK'
     details = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
@@ -719,7 +722,7 @@ def latest_runtime_model_for_agent(agent_id: str) -> Tuple[str, str, str]:
                         model_id = str(data.get('modelId'))
                         provider = str(data.get('provider') or '')
                         timestamp = str(data.get('timestamp') or event.get('timestamp') or '')
-                elif event.get('type') == 'model_change' and event.get('modelId') and not model_id:
+                elif event.get('type') == 'model_change' and event.get('modelId'):
                     model_id = str(event.get('modelId'))
                     provider = str(event.get('provider') or '')
                     timestamp = str(event.get('timestamp') or '')
@@ -732,7 +735,10 @@ def latest_runtime_model_for_agent(agent_id: str) -> Tuple[str, str, str]:
 
 
 def gateway_health_summary() -> Tuple[str, str]:
-    result = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
+    try:
+        result = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
+    except RuntimeError as exc:
+        return 'unknown', str(exc)
     output = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
     if result.returncode == 0:
         return 'ok', output or 'gateway health OK'
@@ -752,10 +758,13 @@ def build_target_check_report(cfg: dict, platform: str, peer_id: str) -> str:
         target_name = draft_target.get('target_name', '')
     if not target_name:
         if platform == 'discord':
-            for channel in list_discord_channels(guild_id):
-                if channel.get('id') == normalized_peer_id:
-                    target_name = channel.get('name', '')
-                    break
+            try:
+                for channel in list_discord_channels(guild_id):
+                    if channel.get('id') == normalized_peer_id:
+                        target_name = channel.get('name', '')
+                        break
+            except RuntimeError:
+                pass
         else:
             for group in list_feishu_groups_from_config(cfg):
                 if group.get('id') == normalized_peer_id:

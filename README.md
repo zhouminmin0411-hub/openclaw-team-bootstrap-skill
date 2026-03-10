@@ -125,6 +125,20 @@ python3 scripts/discord_team_bootstrap.py inspect
 
 `inspect` now compares the enabled draft targets with the current config and reports missing roles, missing generated agents, and `requireMention` mismatches.
 
+### 6. Check a single target across draft, config, and runtime
+
+```bash
+python3 scripts/discord_team_bootstrap.py check-target --platform discord --peer-id <channelId>
+python3 scripts/discord_team_bootstrap.py check-target --platform feishu --peer-id <groupId>
+```
+
+Use `check-target` when you want to debug one specific channel or group. It reports:
+
+- the current draft state
+- the `openclaw.json` binding state
+- configured model vs latest observed runtime model
+- config validation and gateway health summaries
+
 ## Platform behavior
 
 ### Discord

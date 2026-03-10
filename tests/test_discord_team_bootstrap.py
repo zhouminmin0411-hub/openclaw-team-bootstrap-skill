@@ -366,6 +366,61 @@ class DiscordTeamBootstrapTests(unittest.TestCase):
         self.assertIn('status: mismatch', report)
         self.assertIn('requireMention_mismatch', report)
 
+    def test_latest_runtime_model_uses_latest_model_change_event(self):
+        sessions_dir = self.temp_path / 'agents' / 'alpha_ch_123' / 'sessions'
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        (sessions_dir / 's1.jsonl').write_text('\n'.join([
+            '{"type":"session","id":"s1"}',
+            '{"type":"model_change","modelId":"gpt-4.1-mini","timestamp":"2026-03-10T09:00:00Z"}',
+            '{"type":"message","role":"user","content":"hi"}',
+            '{"type":"model_change","modelId":"gpt-5","timestamp":"2026-03-10T10:00:00Z"}'
+        ]) + '\n')
+
+        model, timestamp, source = bootstrap.latest_runtime_model_for_agent('alpha_ch_123')
+        self.assertEqual(model, 'gpt-5')
+        self.assertEqual(timestamp, '2026-03-10T10:00:00Z')
+        self.assertIn('s1.jsonl', source)
+
+    def test_build_target_check_report_tolerates_missing_gateway_command(self):
+        config = self.sample_config()
+        self.write_draft(
+            """
+            # Team Setup Draft
+
+            - generated_at: 2026-03-10T10:00+00:00
+            - mode: draft
+            - guild_id: guild-1
+
+            ## Roles
+            | role | base_agent_id | discord_account | feishu_account | default_model | workspace | discord_mentions |
+            |------|---------------|-----------------|----------------|---------------|-----------|------------------|
+            | alpha | alpha | alpha |  | gpt-4.1 | /work/alpha | @alpha |
+
+            ## Targets
+            | platform | peer_id | target_name | enable | roles | require_mention | custom_models | notes |
+            |----------|---------|-------------|--------|-------|-----------------|--------------|------|
+            | discord | 123 | Existing Channel | yes | alpha | false |  | |
+            """
+        )
+
+        original_run = bootstrap.run
+
+        def fake_run(cmd, check=True):
+            if cmd[0] == 'python3' and 'validate-openclaw-config.py' in cmd[1]:
+                return type('CP', (), {'returncode': 0, 'stdout': '[config-check] OK\n', 'stderr': ''})()
+            if cmd[:3] == ['openclaw', 'gateway', 'health']:
+                raise RuntimeError('Command not found: openclaw')
+            return original_run(cmd, check)
+
+        bootstrap.run = fake_run
+        try:
+            report = bootstrap.build_target_check_report(config, 'discord', '123')
+        finally:
+            bootstrap.run = original_run
+
+        self.assertIn('- gateway_health: unknown', report)
+        self.assertIn('Command not found: openclaw', report)
+
     def test_split_md_row_supports_escaped_pipes(self):
         cells = bootstrap.split_md_row(r'| discord | 123 | name with \| pipe | yes | alpha | true |  | note \| here |')
         self.assertEqual(cells[2], 'name with | pipe')
