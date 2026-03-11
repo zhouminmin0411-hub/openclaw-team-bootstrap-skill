@@ -1147,7 +1147,8 @@ def build_interrupted_apply_report(report: List[str], phase: str, config_written
     lines[0] = 'Draft apply interrupted'
     lines.append(f'- interrupted_phase: {phase}')
     lines.append(f'- config_write_completed: {"yes" if config_written else "no"}')
-    lines.append(f'- backup: {backup}')
+    if not any(line.strip().startswith('- backup:') for line in lines):
+        lines.append(f'- backup: {backup}')
     lines.append('- next_steps:')
     if config_written:
         lines.extend([f'  - {command}' for command in apply_follow_up_commands()])
@@ -1338,7 +1339,7 @@ def cmd_apply(args):
                 failed_report.append('- failure_details:')
                 failed_report.extend([f'  {line}' for line in details.splitlines()])
             persist_report_lines(failed_report)
-        if config_written:
+        if backup.exists():
             RUNTIME.config_path.write_text(backup.read_text())
         raise
     finally:

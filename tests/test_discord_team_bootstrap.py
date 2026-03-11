@@ -512,6 +512,59 @@ class DiscordTeamBootstrapTests(unittest.TestCase):
         self.assertIn('validate', report)
         self.assertIn('health', report)
 
+    def test_build_interrupted_apply_report_does_not_duplicate_backup_line(self):
+        backup = bootstrap.RUNTIME.config_path.with_suffix('.json.bak.discord-team-bootstrap')
+        lines = bootstrap.build_interrupted_apply_report(
+            ['Draft parsed', f'- backup: {backup}'],
+            'config_validation',
+            True,
+            backup,
+        )
+        backup_lines = [line for line in lines if line.startswith('- backup:')]
+        self.assertEqual(len(backup_lines), 1)
+
+    def test_cmd_apply_rolls_back_partial_write_failure(self):
+        config = self.sample_config()
+        bootstrap.save_json(bootstrap.RUNTIME.config_path, config)
+        self.write_draft(
+            """
+            # Team Setup Draft
+
+            - generated_at: 2026-03-10T10:00+00:00
+            - mode: draft
+            - guild_id: guild-1
+
+            ## Roles
+            | role | base_agent_id | discord_account | feishu_account | default_model | workspace | discord_mentions |
+            |------|---------------|-----------------|----------------|---------------|-----------|------------------|
+            | alpha | alpha | alpha |  | gpt-4.1 | /custom/alpha | @alpha |
+
+            ## Targets
+            | platform | peer_id | target_name | enable | roles | require_mention | custom_models | notes |
+            |----------|---------|-------------|--------|-------|-----------------|--------------|------|
+            | discord | 456 | Ops | yes | alpha | false | alpha=gpt-5 | |
+            """
+        )
+
+        original_save_json = bootstrap.save_json
+
+        def fake_save_json(path, data):
+            path.write_text('{"broken": ')
+            raise RuntimeError('disk full during write')
+
+        bootstrap.save_json = fake_save_json
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'disk full during write'):
+                bootstrap.cmd_apply(type('Args', (), {'dry_run': False, 'validate': False})())
+        finally:
+            bootstrap.save_json = original_save_json
+
+        rolled_back = bootstrap.load_json(bootstrap.RUNTIME.config_path)
+        self.assertEqual(rolled_back, config)
+        report = bootstrap.RUNTIME.report_path.read_text()
+        self.assertIn('Draft apply failed', report)
+        self.assertIn('- failed_phase: config_write', report)
+
     def test_split_md_row_supports_escaped_pipes(self):
         cells = bootstrap.split_md_row(r'| discord | 123 | name with \| pipe | yes | alpha | true |  | note \| here |')
         self.assertEqual(cells[2], 'name with | pipe')
