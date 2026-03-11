@@ -94,6 +94,20 @@ python3 scripts/discord_team_bootstrap.py inspect
 - missing or extra bound roles
 - `requireMention` mismatches
 
+### 5) Check a single target across draft / config / runtime
+
+```bash
+python3 scripts/discord_team_bootstrap.py check-target --platform discord --peer-id <channelId>
+python3 scripts/discord_team_bootstrap.py check-target --platform feishu --peer-id <groupId>
+```
+
+`check-target` is the preferred command when a user asks to check or debug one specific channel/group. It reports:
+
+- the draft state
+- the current `openclaw.json` state
+- basic runtime health (`config validate` + `openclaw gateway health`)
+- a conclusion section that calls out mismatches
+
 ## Draft fields
 
 ### Roles table
@@ -160,3 +174,13 @@ Important: on Feishu, `requireMention=false` only lowers the reply gate. Message
 - invalid drafts fail fast instead of silently skipping rows
 - `--validate` runs config validation and gateway health
 - on validation failure, the script restores the backup automatically
+
+## Mention priority rule
+
+When configuring multi-bot targets, treat an explicit bot mention as a higher-priority signal than the default reply policy. The intended behavior is:
+
+- if a message explicitly mentions one bot, that bot should be the only default responder for that message
+- other bots should stay silent unless they were also explicitly mentioned
+- only when no bot was explicitly mentioned should the default `requireMention=false` responders answer
+
+This skill can encode `requireMention` and mention patterns, but strict enforcement of this rule still depends on OpenClaw runtime behavior. Use `check-target` to surface this expectation in reports when debugging target behavior.

@@ -660,10 +660,275 @@ def validate_draft(roles: List[dict], managed_targets: List[dict]) -> Dict[str, 
     return role_map
 
 
+def find_target_in_draft(platform: str, peer_id: str) -> Tuple[List[dict], Optional[dict], str]:
+    roles, managed_targets, guild_id = parse_draft()
+    normalized_peer_id = normalize_peer_id(platform, peer_id)
+    for target in managed_targets:
+        if target['platform'] == platform and normalize_peer_id(platform, target['peer_id']) == normalized_peer_id:
+            return roles, target, guild_id
+    return roles, None, guild_id
+
+
+def config_validation_summary() -> Tuple[str, str]:
+    if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
+        return 'unknown', 'validate script not found'
+    try:
+        result = run(['python3', str(RUNTIME.validate_script)], check=False)
+    except RuntimeError as exc:
+        return 'unknown', str(exc)
+    if result.returncode == 0:
+        return 'ok', (result.stdout or '').strip() or 'config-check OK'
+    details = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
+    return 'error', details or f'config-check failed ({result.returncode})'
+
+
+def configured_model_for_agent(cfg: dict, agent_id: str) -> str:
+    for agent in cfg.get('agents', {}).get('list', []):
+        if agent.get('id') == agent_id:
+            return ((agent.get('model') or {}).get('primary') or '').strip()
+    return ''
+
+
+def agent_state_root() -> Path:
+    return RUNTIME.config_path.parent / 'agents'
+
+
+def latest_runtime_model_for_agent(agent_id: str) -> Tuple[str, str, str]:
+    sessions_dir = agent_state_root() / agent_id / 'sessions'
+    if not sessions_dir.exists():
+        return 'unknown', '', 'no session directory found'
+
+    session_files = sorted(sessions_dir.glob('*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not session_files:
+        return 'unknown', '', 'no session files found'
+
+    latest = session_files[0]
+    model_id = ''
+    provider = ''
+    timestamp = ''
+    try:
+        with latest.open('r', encoding='utf-8', errors='ignore') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get('type') == 'custom' and event.get('customType') == 'model-snapshot':
+                    data = event.get('data') or {}
+                    if data.get('modelId'):
+                        model_id = str(data.get('modelId'))
+                        provider = str(data.get('provider') or '')
+                        timestamp = str(data.get('timestamp') or event.get('timestamp') or '')
+                elif event.get('type') == 'model_change' and event.get('modelId'):
+                    model_id = str(event.get('modelId'))
+                    provider = str(event.get('provider') or '')
+                    timestamp = str(event.get('timestamp') or '')
+        if model_id:
+            full = f'{provider}/{model_id}' if provider else model_id
+            return full, timestamp, f'latest session: {latest.name}'
+        return 'unknown', '', f'no model snapshot found in {latest.name}'
+    except Exception as exc:
+        return 'unknown', '', f'failed to read {latest.name}: {exc}'
+
+
+def gateway_health_summary() -> Tuple[str, str]:
+    try:
+        result = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
+    except RuntimeError as exc:
+        return 'unknown', str(exc)
+    output = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
+    if result.returncode == 0:
+        return 'ok', output or 'gateway health OK'
+    return 'error', output or f'gateway health failed ({result.returncode})'
+
+
+def build_target_check_report(cfg: dict, platform: str, peer_id: str) -> str:
+    roles, draft_target, guild_id = find_target_in_draft(platform, peer_id)
+    normalized_peer_id = normalize_peer_id(platform, peer_id)
+    state = existing_platform_state(cfg, platform, roles, guild_id if platform == 'discord' else '')
+    current = state.get(normalized_peer_id, {'bound_roles': [], 'roles': {}})
+    actual_roles = dedupe(current.get('bound_roles', []))
+    agent_ids = {agent.get('id', '') for agent in cfg.get('agents', {}).get('list', [])}
+
+    target_name = ''
+    if draft_target:
+        target_name = draft_target.get('target_name', '')
+    if not target_name:
+        if platform == 'discord':
+            try:
+                for channel in list_discord_channels(guild_id):
+                    if channel.get('id') == normalized_peer_id:
+                        target_name = channel.get('name', '')
+                        break
+            except RuntimeError:
+                pass
+        else:
+            for group in list_feishu_groups_from_config(cfg):
+                if group.get('id') == normalized_peer_id:
+                    target_name = group.get('name', '')
+                    break
+
+    report = [
+        '# Target Check Report',
+        f'- platform: {platform}',
+        f'- peer_id: {normalized_peer_id}',
+        f'- target_name: {target_name or "-"}',
+        f'- guild_id: {guild_id or "-"}',
+        '',
+        '## Draft state',
+    ]
+
+    if draft_target:
+        report.extend([
+            f'- enabled: yes',
+            f'- roles: {",".join(draft_target.get("roles", [])) or "-"}',
+            f'- require_mention: {draft_target.get("require_mention", "") or "-"}',
+            f'- custom_models: {draft_target.get("custom_models", "") or "-"}',
+        ])
+    else:
+        report.extend([
+            '- enabled: no',
+            '- roles: -',
+            '- require_mention: -',
+            '- custom_models: -',
+            '- note: target not enabled in current draft',
+        ])
+
+    report.extend(['', '## Config state'])
+
+    if actual_roles:
+        report.append(f'- bound_roles: {",".join(actual_roles)}')
+    else:
+        report.append('- bound_roles: -')
+        report.append('- note: no binding found for this target in openclaw.json')
+
+    role_names = draft_target.get('roles', []) if draft_target else actual_roles
+    if not role_names:
+        role_names = actual_roles
+
+    report.extend(['', '## Model state'])
+    draft_custom_models = parse_custom_models(draft_target.get('custom_models', '')) if draft_target else {}
+    role_map = {role['role']: role for role in roles}
+
+    for role_name in role_names:
+        expected_agent_id = make_agent_id(role_name, platform, normalized_peer_id)
+        actual = current.get('roles', {}).get(role_name)
+        report.append(
+            f"- role={role_name}: expected_agent={expected_agent_id} agent_present={'yes' if expected_agent_id in agent_ids else 'no'}"
+        )
+        if actual:
+            report.append(
+                f"  config_binding_agent={actual.get('agentId', '-') or '-'} requireMention={actual.get('requireMention', True)}"
+            )
+        else:
+            report.append('  config_binding_agent=- requireMention=-')
+
+        role_cfg = role_map.get(role_name, {})
+        expected_model = (draft_custom_models.get(role_name) or role_cfg.get('default_model') or '').strip() or '-'
+        configured_model = configured_model_for_agent(cfg, expected_agent_id) or '-'
+        runtime_model, runtime_timestamp, runtime_source = latest_runtime_model_for_agent(expected_agent_id)
+        report.append(f'  expected_model={expected_model}')
+        report.append(f'  configured_model={configured_model}')
+        report.append(f'  actual_runtime_model={runtime_model or "unknown"}')
+        if runtime_timestamp:
+            report.append(f'  actual_runtime_model_timestamp={runtime_timestamp}')
+        if runtime_source:
+            report.append(f'  actual_runtime_model_source={runtime_source}')
+
+    report.extend(['', '## Runtime state'])
+    validate_status, validate_details = config_validation_summary()
+    gateway_status, gateway_details = gateway_health_summary()
+    report.append(f'- config_validation: {validate_status}')
+    report.append(f'- gateway_health: {gateway_status}')
+    if validate_details:
+        report.append('- config_validation_details:')
+        report.extend([f'  {line}' for line in validate_details.splitlines()])
+    if gateway_details:
+        report.append('- gateway_health_details:')
+        report.extend([f'  {line}' for line in gateway_details.splitlines()])
+
+    report.extend(['', '## Mention behavior note'])
+    report.append('- Desired collaboration rule: if a message explicitly mentions one bot, that bot should be the only default responder for that message; non-mentioned bots should stay silent unless they were also explicitly mentioned.')
+    report.append('- Current skill can encode requireMention and mention patterns, but strict runtime enforcement of "mentioned bot only" still depends on OpenClaw runtime behavior.')
+
+    report.extend(['', '## Conclusion'])
+    issues = []
+    if not draft_target:
+        issues.append('target not enabled in draft')
+    else:
+        expected_roles = draft_target.get('roles', [])
+        missing_roles = [role for role in expected_roles if role not in actual_roles]
+        extra_roles = [role for role in actual_roles if role not in expected_roles]
+        if missing_roles:
+            issues.append(f'missing_roles={",".join(missing_roles)}')
+        if extra_roles:
+            issues.append(f'extra_roles={",".join(extra_roles)}')
+        require_map = parse_require_mention_map(draft_target.get('require_mention', ''), expected_roles, True)
+        draft_custom_models = parse_custom_models(draft_target.get('custom_models', ''))
+        role_cfg_map = {role['role']: role for role in roles}
+        for role_name in expected_roles:
+            actual = current.get('roles', {}).get(role_name)
+            expected_agent_id = make_agent_id(role_name, platform, normalized_peer_id)
+            if expected_agent_id not in agent_ids:
+                issues.append(f'{role_name}:agent_missing')
+            if not actual:
+                issues.append(f'{role_name}:binding_missing')
+                continue
+            if actual.get('agentId') != expected_agent_id:
+                issues.append(f'{role_name}:binding_agent_mismatch')
+            if actual.get('requireMention', True) != require_map.get(role_name, True):
+                issues.append(f'{role_name}:requireMention_mismatch')
+            expected_model = (draft_custom_models.get(role_name) or (role_cfg_map.get(role_name, {}) or {}).get('default_model') or '').strip()
+            configured_model = configured_model_for_agent(cfg, expected_agent_id)
+            if expected_model and configured_model and expected_model != configured_model:
+                issues.append(f'{role_name}:configured_model_mismatch')
+            runtime_model, _, _ = latest_runtime_model_for_agent(expected_agent_id)
+            if expected_model and runtime_model not in {'', 'unknown'} and expected_model != runtime_model:
+                issues.append(f'{role_name}:runtime_model_mismatch')
+    if validate_status != 'ok':
+        issues.append('config_validation_failed')
+    if gateway_status != 'ok':
+        issues.append('gateway_health_failed')
+
+    if issues:
+        report.append(f'- status: mismatch')
+        report.append(f'- issues: {"; ".join(issues)}')
+    else:
+        report.append('- status: ok')
+        report.append('- issues: -')
+        report.append('- summary: draft, config, and basic runtime health are consistent for this target.')
+
+    return '\n'.join(report).rstrip() + '\n'
+
+
 def resolve_role_workspace(cfg: dict, role: dict, platform: str) -> str:
     if role.get('workspace'):
         return role['workspace']
     return detect_workspace(cfg, role['role'], role['base_agent_id'], platform, RUNTIME.fallback_workspace)
+
+
+def expected_model_for_target_role(role_map: Dict[str, dict], target: dict, role_name: str) -> str:
+    custom_models = parse_custom_models(target.get('custom_models', ''))
+    role = role_map.get(role_name, {}) or {}
+    return (custom_models.get(role_name) or role.get('default_model') or '').strip()
+
+
+def verify_configured_models(cfg: dict, roles: List[dict], managed_targets: List[dict]) -> List[str]:
+    role_map = {role['role']: role for role in roles}
+    issues = []
+    for target in managed_targets:
+        for role_name in target.get('roles', []):
+            expected_model = expected_model_for_target_role(role_map, target, role_name)
+            agent_id = make_agent_id(role_name, target['platform'], target['peer_id'])
+            configured_model = configured_model_for_agent(cfg, agent_id)
+            if expected_model != configured_model:
+                issues.append(
+                    f"[{target['platform']}] {target['peer_id']} role={role_name} expected_model={expected_model or '-'} configured_model={configured_model or '-'}"
+                )
+    return issues
 
 
 def apply_from_draft(cfg: dict):
@@ -915,7 +1180,13 @@ def cmd_apply(args):
             return
 
         save_json(RUNTIME.config_path, new_cfg)
+        reloaded_cfg = load_json(RUNTIME.config_path)
+        model_issues = verify_configured_models(reloaded_cfg, roles, managed_targets)
+        if model_issues:
+            raise RuntimeError('configured model sync failed:\n- ' + '\n- '.join(model_issues))
+
         report[0] = 'Draft applied'
+        report.append('- model_sync: ok')
         if args.validate:
             if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
                 raise RuntimeError(
@@ -947,6 +1218,18 @@ def cmd_inspect(args):
     print(text)
 
 
+def cmd_check_target(args):
+    platform = (args.platform or '').strip().lower()
+    if platform not in SUPPORTED_PLATFORMS:
+        raise RuntimeError('check-target requires --platform discord|feishu')
+    if not (args.peer_id or '').strip():
+        raise RuntimeError('check-target requires --peer-id')
+    cfg = load_json(RUNTIME.config_path)
+    text = build_target_check_report(cfg, platform, args.peer_id.strip())
+    write_report(text)
+    print(text)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Discord / Feishu multi-agent bootstrap skill')
     parser.add_argument('--skill-dir', default='', help='Skill directory used to resolve default draft/report paths.')
@@ -974,6 +1257,11 @@ def main():
 
     inspect = sub.add_parser('inspect')
     inspect.set_defaults(func=cmd_inspect)
+
+    check_target = sub.add_parser('check-target')
+    check_target.add_argument('--platform', required=True, help='Target platform: discord or feishu')
+    check_target.add_argument('--peer-id', required=True, help='Target channel id or Feishu group id')
+    check_target.set_defaults(func=cmd_check_target)
 
     args = parser.parse_args()
     global RUNTIME
