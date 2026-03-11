@@ -82,6 +82,16 @@ Apply with validation:
 python3 scripts/discord_team_bootstrap.py apply --validate
 ```
 
+Stepwise alternative for timeout-prone hosts:
+
+```bash
+python3 scripts/discord_team_bootstrap.py apply
+python3 scripts/discord_team_bootstrap.py validate
+python3 scripts/discord_team_bootstrap.py health
+```
+
+Use the stepwise flow when the host may terminate long-running commands before they finish cleanly.
+
 ### 4) Inspect current config against the enabled draft
 
 ```bash
@@ -171,6 +181,8 @@ Important: on Feishu, `requireMention=false` only lowers the reply gate. Message
 ## Safety
 
 - `apply` creates a backup before modifying config
+- `apply --validate` writes the report after each completed phase so interrupted runs are easier to classify
+- `validate` and `health` are available as standalone post-check commands
 - invalid drafts fail fast instead of silently skipping rows
 - `--validate` runs config validation and gateway health
 - on validation failure, the script restores the backup automatically
