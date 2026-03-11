@@ -117,6 +117,14 @@ python3 scripts/discord_team_bootstrap.py apply --dry-run
 python3 scripts/discord_team_bootstrap.py apply --validate
 ```
 
+For long-running or timeout-prone hosts, use the stepwise workflow instead:
+
+```bash
+python3 scripts/discord_team_bootstrap.py apply
+python3 scripts/discord_team_bootstrap.py validate
+python3 scripts/discord_team_bootstrap.py health
+```
+
 ### 5. Inspect drift between draft and current config
 
 ```bash
@@ -164,9 +172,12 @@ Important: on Feishu, `requireMention=false` only lowers the reply gate. Whether
 ## Validation and safety
 
 - `apply` creates `openclaw.json.bak.discord-team-bootstrap`
-- `apply --validate` runs the validation script, then `openclaw gateway health`
+- `apply --validate` now writes progress to the report after each phase
+- `validate` runs only the validation script
+- `health` runs only `openclaw gateway health`
 - if validation fails, the script restores the backup automatically
 - invalid draft rows now fail fast instead of silently skipping targets
+- if the host interrupts `apply --validate`, the report should still show the last completed phase and recommended follow-up checks
 
 ## Limits
 

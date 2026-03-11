@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -670,10 +671,8 @@ def find_target_in_draft(platform: str, peer_id: str) -> Tuple[List[dict], Optio
 
 
 def config_validation_summary() -> Tuple[str, str]:
-    if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
-        return 'unknown', 'validate script not found'
     try:
-        result = run(['python3', str(RUNTIME.validate_script)], check=False)
+        result = run_config_validation()
     except RuntimeError as exc:
         return 'unknown', str(exc)
     if result.returncode == 0:
@@ -736,7 +735,7 @@ def latest_runtime_model_for_agent(agent_id: str) -> Tuple[str, str, str]:
 
 def gateway_health_summary() -> Tuple[str, str]:
     try:
-        result = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
+        result = run_gateway_health_command()
     except RuntimeError as exc:
         return 'unknown', str(exc)
     output = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
@@ -1117,6 +1116,65 @@ def write_report(text: str):
     RUNTIME.report_path.write_text(text)
 
 
+def format_report(lines: List[str]) -> str:
+    return '\n'.join(lines) + '\n'
+
+
+def persist_report_lines(lines: List[str]) -> str:
+    text = format_report(lines)
+    write_report(text)
+    return text
+
+
+def print_progress(line: str):
+    print(line, flush=True)
+
+
+def script_command(subcommand: str) -> str:
+    return f"python3 {RUNTIME.skill_dir / 'scripts/discord_team_bootstrap.py'} {subcommand}"
+
+
+def apply_follow_up_commands() -> List[str]:
+    return [
+        script_command('validate'),
+        script_command('health'),
+        script_command('inspect'),
+    ]
+
+
+def build_interrupted_apply_report(report: List[str], phase: str, config_written: bool, backup: Path) -> List[str]:
+    lines = list(report)
+    lines[0] = 'Draft apply interrupted'
+    lines.append(f'- interrupted_phase: {phase}')
+    lines.append(f'- config_write_completed: {"yes" if config_written else "no"}')
+    lines.append(f'- backup: {backup}')
+    lines.append('- next_steps:')
+    if config_written:
+        lines.extend([f'  - {command}' for command in apply_follow_up_commands()])
+        lines.append('  - Optionally run `check-target` for the specific channel/group you were updating.')
+    else:
+        lines.append('  - Re-run `apply` after checking host timeout or session lifetime.')
+    return lines
+
+
+def require_validate_script() -> Path:
+    if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
+        raise RuntimeError(
+            'Validation requested, but validate script was not found. '
+            'Set --validate-script or OPENCLAW_TEAM_BOOTSTRAP_VALIDATE_SCRIPT.'
+        )
+    return RUNTIME.validate_script
+
+
+def run_config_validation() -> subprocess.CompletedProcess:
+    validate_script = require_validate_script()
+    return run(['python3', str(validate_script)], check=False)
+
+
+def run_gateway_health_command() -> subprocess.CompletedProcess:
+    return run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
+
+
 def cmd_scan(args):
     cfg = load_json(RUNTIME.config_path)
     guild_id = args.guild_id or find_default_guild(cfg)
@@ -1155,10 +1213,48 @@ How to edit:
     print(text)
 
 
+def cmd_validate(args):
+    result = run_config_validation()
+    report = ['Config validation']
+    report.append(f'- config_path: {RUNTIME.config_path}')
+    if result.returncode == 0:
+        report.append('- validate: ok')
+    else:
+        report.append('- validate: error')
+    details = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
+    if details:
+        report.append('- validate_output:')
+        report.extend([f'  {line}' for line in details.splitlines()])
+    text = persist_report_lines(report)
+    print(text, end='')
+    if result.returncode != 0:
+        raise RuntimeError(details or f'config validate failed ({result.returncode})')
+
+
+def cmd_health(args):
+    result = run_gateway_health_command()
+    report = ['Gateway health']
+    if result.returncode == 0:
+        report.append('- gateway_health: ok')
+    else:
+        report.append('- gateway_health: error')
+    details = '\n'.join(x for x in [result.stdout.strip(), result.stderr.strip()] if x).strip()
+    if details:
+        report.append('- gateway_health_output:')
+        report.extend([f'  {line}' for line in details.splitlines()])
+    text = persist_report_lines(report)
+    print(text, end='')
+    if result.returncode != 0:
+        raise RuntimeError(details or f'gateway health failed ({result.returncode})')
+
+
 def cmd_apply(args):
     cfg = load_json(RUNTIME.config_path)
     backup = RUNTIME.config_path.with_suffix(RUNTIME.config_path.suffix + '.bak.discord-team-bootstrap')
     backup.write_text(RUNTIME.config_path.read_text())
+    phase = 'startup'
+    config_written = False
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         new_cfg, roles, managed_targets, guild_id = apply_from_draft(cfg)
         report = [
@@ -1172,43 +1268,81 @@ def cmd_apply(args):
             report.append(
                 f"  - [{row.get('platform', '')}] {row.get('target_name', '')} ({row.get('peer_id', '')}): roles={','.join(row.get('roles', []))} require_mention={row.get('require_mention', '')} custom_models={row.get('custom_models', '') or '-'}"
             )
+        report.append(f'- backup: {backup}')
+        persist_report_lines(report)
+
+        def handle_sigterm(signum, frame):
+            interrupted = build_interrupted_apply_report(report, phase, config_written, backup)
+            persist_report_lines(interrupted)
+            print_progress(f'Command interrupted by signal {signal.Signals(signum).name} during {phase}')
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, handle_sigterm)
 
         if args.dry_run:
-            text = '\n'.join(report + ['- dry_run: true', f'- backup: {backup}']) + '\n'
-            write_report(text)
-            print(text)
+            report.append('- dry_run: true')
+            text = persist_report_lines(report)
+            print(text, end='')
             return
 
+        phase = 'config_write'
         save_json(RUNTIME.config_path, new_cfg)
+        config_written = True
+        report[0] = 'Draft applied'
+        report.append('- config_write: ok')
+        persist_report_lines(report)
+        print_progress('- config_write: ok')
+
+        phase = 'model_sync_verification'
         reloaded_cfg = load_json(RUNTIME.config_path)
         model_issues = verify_configured_models(reloaded_cfg, roles, managed_targets)
         if model_issues:
             raise RuntimeError('configured model sync failed:\n- ' + '\n- '.join(model_issues))
 
-        report[0] = 'Draft applied'
         report.append('- model_sync: ok')
+        persist_report_lines(report)
+        print_progress('- model_sync: ok')
         if args.validate:
-            if not RUNTIME.validate_script or not RUNTIME.validate_script.exists():
-                raise RuntimeError(
-                    'Validation requested, but validate script was not found. '
-                    'Set --validate-script or OPENCLAW_TEAM_BOOTSTRAP_VALIDATE_SCRIPT.'
-                )
-            validate = run(['python3', str(RUNTIME.validate_script)], check=False)
+            phase = 'config_validation'
+            validate = run_config_validation()
             if validate.returncode != 0:
                 raise RuntimeError(f'config validate failed:\n{validate.stdout}\n{validate.stderr}')
-            health = run([RUNTIME.openclaw_bin, 'gateway', 'health'], check=False)
             report.append('- validate: ok')
+            validate_output = '\n'.join(x for x in [validate.stdout.strip(), validate.stderr.strip()] if x).strip()
+            if validate_output:
+                report.append('- validate_output:')
+                report.extend([f'  {line}' for line in validate_output.splitlines()])
+            persist_report_lines(report)
+            print_progress('- validate: ok')
+
+            phase = 'gateway_health'
+            health = run_gateway_health_command()
             report.append(f'- gateway_health_code: {health.returncode}')
-            if health.stdout.strip():
+            health_output = '\n'.join(x for x in [health.stdout.strip(), health.stderr.strip()] if x).strip()
+            if health_output:
                 report.append('- gateway_health_output:')
-                report.append(health.stdout.strip())
-        report.append(f'- backup: {backup}')
-        text = '\n'.join(report) + '\n'
-        write_report(text)
-        print(text)
-    except Exception:
-        RUNTIME.config_path.write_text(backup.read_text())
+                report.extend([f'  {line}' for line in health_output.splitlines()])
+            persist_report_lines(report)
+            print_progress(f'- gateway_health_code: {health.returncode}')
+        phase = 'complete'
+        text = persist_report_lines(report)
+        print(text, end='')
+    except Exception as exc:
+        if 'report' in locals():
+            failed_report = list(report)
+            failed_report[0] = 'Draft apply failed'
+            failed_report.append(f'- failed_phase: {phase}')
+            failed_report.append(f'- config_write_completed: {"yes" if config_written else "no"}')
+            details = str(exc).strip()
+            if details:
+                failed_report.append('- failure_details:')
+                failed_report.extend([f'  {line}' for line in details.splitlines()])
+            persist_report_lines(failed_report)
+        if config_written:
+            RUNTIME.config_path.write_text(backup.read_text())
         raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def cmd_inspect(args):
@@ -1249,6 +1383,12 @@ def main():
 
     explain = sub.add_parser('explain')
     explain.set_defaults(func=cmd_explain)
+
+    validate = sub.add_parser('validate')
+    validate.set_defaults(func=cmd_validate)
+
+    health = sub.add_parser('health')
+    health.set_defaults(func=cmd_health)
 
     apply = sub.add_parser('apply')
     apply.add_argument('--validate', action='store_true')

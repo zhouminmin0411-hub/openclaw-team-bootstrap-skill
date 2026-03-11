@@ -219,6 +219,83 @@ class DiscordTeamBootstrapTests(unittest.TestCase):
         rolled_back = bootstrap.load_json(bootstrap.RUNTIME.config_path)
         self.assertEqual(rolled_back, config)
 
+    def test_cmd_validate_writes_stepwise_report(self):
+        bootstrap.save_json(bootstrap.RUNTIME.config_path, self.sample_config())
+        bootstrap.cmd_validate(type('Args', (), {})())
+        report = bootstrap.RUNTIME.report_path.read_text()
+        self.assertIn('Config validation', report)
+        self.assertIn('- validate: ok', report)
+        self.assertIn(str(bootstrap.RUNTIME.config_path), report)
+
+    def test_cmd_health_writes_stepwise_report(self):
+        original_run = bootstrap.run
+
+        def fake_run(cmd, check=True):
+            if cmd[:3] == ['openclaw', 'gateway', 'health']:
+                return type('CP', (), {'returncode': 0, 'stdout': 'Gateway Health\nOK\n', 'stderr': ''})()
+            return original_run(cmd, check)
+
+        bootstrap.run = fake_run
+        try:
+            bootstrap.cmd_health(type('Args', (), {})())
+        finally:
+            bootstrap.run = original_run
+
+        report = bootstrap.RUNTIME.report_path.read_text()
+        self.assertIn('Gateway health', report)
+        self.assertIn('- gateway_health: ok', report)
+        self.assertIn('Gateway Health', report)
+
+    def test_cmd_apply_persists_progress_before_validate_failure(self):
+        config = self.sample_config()
+        bootstrap.save_json(bootstrap.RUNTIME.config_path, config)
+        self.write_draft(
+            """
+            # Team Setup Draft
+
+            - generated_at: 2026-03-10T10:00+00:00
+            - mode: draft
+            - guild_id: guild-1
+
+            ## Roles
+            | role | base_agent_id | discord_account | feishu_account | default_model | workspace | discord_mentions |
+            |------|---------------|-----------------|----------------|---------------|-----------|------------------|
+            | alpha | alpha | alpha |  | gpt-4.1 | /custom/alpha | @alpha |
+
+            ## Targets
+            | platform | peer_id | target_name | enable | roles | require_mention | custom_models | notes |
+            |----------|---------|-------------|--------|-------|-----------------|--------------|------|
+            | discord | 456 | Ops | yes | alpha | false | alpha=gpt-5 | |
+            """
+        )
+
+        original_run_config_validation = bootstrap.run_config_validation
+        original_run_health = bootstrap.run_gateway_health_command
+
+        def fake_run_config_validation():
+            return type('CP', (), {'returncode': 1, 'stdout': '', 'stderr': 'validate boom'})()
+
+        def fake_run_health():
+            return type('CP', (), {'returncode': 0, 'stdout': 'OK', 'stderr': ''})()
+
+        bootstrap.run_config_validation = fake_run_config_validation
+        bootstrap.run_gateway_health_command = fake_run_health
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'config validate failed'):
+                bootstrap.cmd_apply(type('Args', (), {'dry_run': False, 'validate': True})())
+        finally:
+            bootstrap.run_config_validation = original_run_config_validation
+            bootstrap.run_gateway_health_command = original_run_health
+
+        report = bootstrap.RUNTIME.report_path.read_text()
+        self.assertIn('Draft apply failed', report)
+        self.assertIn('- config_write: ok', report)
+        self.assertIn('- model_sync: ok', report)
+        self.assertIn('- failed_phase: config_validation', report)
+        self.assertNotIn('- validate: ok', report)
+        rolled_back = bootstrap.load_json(bootstrap.RUNTIME.config_path)
+        self.assertEqual(rolled_back, config)
+
     def test_validate_draft_rejects_missing_platform_account(self):
         roles = [
             {
@@ -420,6 +497,20 @@ class DiscordTeamBootstrapTests(unittest.TestCase):
 
         self.assertIn('- gateway_health: unknown', report)
         self.assertIn('Command not found: openclaw', report)
+
+    def test_build_interrupted_apply_report_includes_follow_up_commands(self):
+        lines = bootstrap.build_interrupted_apply_report(
+            ['Draft parsed', '- managed_targets: 1'],
+            'config_validation',
+            True,
+            bootstrap.RUNTIME.config_path.with_suffix('.json.bak.discord-team-bootstrap'),
+        )
+        report = '\n'.join(lines)
+        self.assertIn('Draft apply interrupted', report)
+        self.assertIn('config_write_completed: yes', report)
+        self.assertIn('python3', report)
+        self.assertIn('validate', report)
+        self.assertIn('health', report)
 
     def test_split_md_row_supports_escaped_pipes(self):
         cells = bootstrap.split_md_row(r'| discord | 123 | name with \| pipe | yes | alpha | true |  | note \| here |')
